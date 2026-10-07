@@ -1,0 +1,354 @@
+<main class="shell">
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Resilient store enrichment</p>
+      <h1>{{ title }}</h1>
+      <p class="subtitle">Turn store data into consistent, explainable tiers.</p>
+    </div>
+    <span class="connection"><i></i> Local workspace</span>
+  </header>
+
+  @if (error) {
+    <div class="alert error" role="alert">{{ error }}</div>
+  }
+  @if (notice) {
+    <div class="alert success" role="status">{{ notice }}</div>
+  }
+
+  <section class="panel upload-panel">
+    <div class="section-heading">
+      <div class="step">01</div>
+      <div>
+        <h2>Upload stores</h2>
+        <p>CSV must include store_id, store_name, address, city, state, and country.</p>
+      </div>
+    </div>
+    <div class="upload-controls">
+      <label class="file-picker">
+        <span>{{ selectedFile?.name || 'Choose a CSV file' }}</span>
+        <input type="file" accept=".csv,text/csv" (change)="onFileSelected($event)" />
+      </label>
+      <input
+        class="job-name"
+        type="text"
+        placeholder="Job name"
+        [(ngModel)]="jobName"
+        aria-label="Job name"
+      />
+      <button class="primary-btn" (click)="submitUpload()" [disabled]="busy || !selectedFile">
+        {{ busy ? 'Starting…' : 'Start enrichment' }}
+      </button>
+    </div>
+    <p class="hint">
+      Jobs are processed at the simulator’s shared request limit. Each store retains its own status
+      and failure reason.
+    </p>
+  </section>
+
+  <section class="jobs-row">
+    <div class="job-select">
+      <label for="job-select">Select job</label>
+      <select
+        id="job-select"
+        [ngModel]="selectedJobId"
+        (ngModelChange)="selectJob(+$event)"
+        [disabled]="!jobs.length"
+      >
+        @for (job of jobs; track job.id) {
+          <option [ngValue]="job.id">#{{ job.id }} · {{ job.name }} · {{ job.status }}</option>
+        }
+      </select>
+      @if (jobsLoading) {
+        <span class="muted">Loading jobs…</span>
+      }
+    </div>
+    @if (activeJob) {
+      <span class="status-pill" [class.running]="activeJob.status === 'running'">{{
+        activeJob.status
+      }}</span>
+    }
+  </section>
+
+  @if (activeJob; as job) {
+    <section class="metrics-grid">
+      <article class="panel metric-card">
+        <span class="metric-label">Enriched</span>
+        <strong>{{ job.enriched_stores | number }}</strong>
+        <div class="progress-track">
+          <div
+            class="progress-value"
+            [style.width.%]="job.total_stores ? (job.enriched_stores / job.total_stores) * 100 : 0"
+          ></div>
+        </div>
+        <small>of {{ job.total_stores | number }} stores</small>
+      </article>
+      <article class="panel metric-card">
+        <span class="metric-label">Pending</span>
+        <strong>{{ job.pending_stores | number }}</strong>
+        <small>queued or in progress</small>
+      </article>
+      <article class="panel metric-card">
+        <span class="metric-label">Failed</span>
+        <strong>{{ job.failed_stores | number }}</strong>
+        <small>terminal after bounded retries</small>
+      </article>
+      <article class="panel metric-card">
+        <span class="metric-label">Tiered</span>
+        <strong>{{
+          job.tier_breakdown.Large + job.tier_breakdown.Medium + job.tier_breakdown.Small | number
+        }}</strong>
+        <small>scored stores</small>
+      </article>
+    </section>
+
+    <section class="content-grid">
+      <article class="panel config-panel">
+        <div class="section-heading compact">
+          <div class="step">02</div>
+          <div>
+            <h2>Scoring configuration</h2>
+            <p>Scores are recalculated from stored metrics—no enrichment calls.</p>
+          </div>
+        </div>
+        <div class="config-table">
+          <div class="config-header">
+            <span>Metric</span><span>Minimum bar</span><span>Weight</span>
+          </div>
+          <label>
+            <span>Monthly footfall</span>
+            <input type="number" min="0" [(ngModel)]="scoring.bars.estimated_monthly_footfall" />
+            <div class="weight-input">
+              <input
+                type="number"
+                min="0"
+                max="100"
+                [(ngModel)]="scoring.weights.estimated_monthly_footfall"
+              /><span>%</span>
+            </div>
+          </label>
+          <label>
+            <span>Monthly revenue</span>
+            <input type="number" min="0" [(ngModel)]="scoring.bars.estimated_monthly_revenue" />
+            <div class="weight-input">
+              <input
+                type="number"
+                min="0"
+                max="100"
+                [(ngModel)]="scoring.weights.estimated_monthly_revenue"
+              /><span>%</span>
+            </div>
+          </label>
+          <label>
+            <span>Store size (sqft)</span>
+            <input type="number" min="0" [(ngModel)]="scoring.bars.store_size_sqft" />
+            <div class="weight-input">
+              <input
+                type="number"
+                min="0"
+                max="100"
+                [(ngModel)]="scoring.weights.store_size_sqft"
+              /><span>%</span>
+            </div>
+          </label>
+        </div>
+        <div class="tier-config">
+          <label
+            >Large tier ≥
+            <input type="number" min="0" max="100" [(ngModel)]="scoring.thresholds.Large" />%</label
+          >
+          <label
+            >Medium tier ≥
+            <input
+              type="number"
+              min="0"
+              max="100"
+              [(ngModel)]="scoring.thresholds.Medium"
+            />%</label
+          >
+          <span [class.invalid]="weightTotal !== 100">Weights total: {{ weightTotal }}%</span>
+        </div>
+        <button
+          class="primary-btn score-btn"
+          (click)="runScoring()"
+          [disabled]="scoringBusy || job.status === 'running' || job.status === 'queued'"
+        >
+          {{ scoringBusy ? 'Scoring…' : 'Compute scores and tiers' }}
+        </button>
+      </article>
+
+      <article class="panel breakdown-panel">
+        <div class="section-heading compact">
+          <div class="step">03</div>
+          <div>
+            <h2>Tier breakdown</h2>
+            <p>Counts for the latest scoring configuration.</p>
+          </div>
+        </div>
+        @for (tier of tiers; track tier) {
+          <div class="tier-row">
+            <span class="tier-mark" [class]="tier.toLowerCase()"></span>
+            <span>{{ tier }}</span>
+            <strong>{{ job.tier_breakdown[tier] | number }}</strong>
+          </div>
+        }
+      </article>
+    </section>
+
+    <section class="panel store-panel">
+      <div class="table-heading">
+        <div class="section-heading compact">
+          <div class="step">04</div>
+          <div>
+            <h2>Stores</h2>
+            <p>Enrichment results, scoring, and any terminal error.</p>
+          </div>
+        </div>
+        <label class="filter-label"
+          >Search
+          <input
+            type="search"
+            placeholder="Store, ID, or city"
+            [(ngModel)]="searchTerm"
+            (ngModelChange)="searchStores()"
+          />
+        </label>
+        <label class="filter-label"
+          >Status
+          <select [ngModel]="selectedStatus" (ngModelChange)="setStatusFilter($event)">
+            <option value="">All statuses</option>
+            @for (status of statuses; track status) {
+              <option [value]="status">{{ status }}</option>
+            }
+          </select>
+        </label>
+        <label class="filter-label"
+          >Tier
+          <select [ngModel]="selectedTier" (ngModelChange)="setTierFilter($event)">
+            <option value="">All stores</option>
+            @for (tier of tiers; track tier) {
+              <option [value]="tier">{{ tier }}</option>
+            }
+          </select>
+        </label>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Store</th>
+              <th>Status</th>
+              <th>Footfall</th>
+              <th>Revenue / month</th>
+              <th>Size</th>
+              <th>Score</th>
+              <th>Tier / error</th>
+            </tr>
+          </thead>
+          <tbody>
+            @if (storesLoading && !stores.length) {
+              <tr>
+                <td colspan="7" class="empty-state">Loading store results…</td>
+              </tr>
+            }
+            @for (store of stores; track store.store_id) {
+              <tr>
+                <td>
+                  <strong>{{ store.store_name }}</strong
+                  ><small>{{ store.store_id }} · {{ store.city }}, {{ store.state }}</small>
+                </td>
+                <td>
+                  <span class="store-status" [class]="store.status">{{ store.status }}</span
+                  ><small>{{ store.attempts }} attempts</small>
+                </td>
+                <td>
+                  {{
+                    store.estimated_monthly_footfall === null
+                      ? '—'
+                      : (store.estimated_monthly_footfall | number)
+                  }}
+                </td>
+                <td>
+                  {{
+                    store.estimated_monthly_revenue === null
+                      ? '—'
+                      : (store.estimated_monthly_revenue | number: '1.0-0')
+                  }}
+                </td>
+                <td>
+                  {{ store.store_size_sqft === null ? '—' : (store.store_size_sqft | number) }}
+                </td>
+                <td>
+                  {{ store.score === null ? '—' : (store.score | number: '1.0-2') + '%' }}
+                </td>
+                <td>
+                  @if (store.tier) {
+                    <span class="tier-badge" [class]="store.tier.toLowerCase()">{{
+                      store.tier
+                    }}</span>
+                  } @else if (store.failure_reason) {
+                    <span class="failure-reason">{{ store.failure_reason }}</span>
+                  } @else {
+                    <span class="muted">Not scored</span>
+                  }
+                </td>
+              </tr>
+            } @empty {
+              @if (!storesLoading) {
+                <tr>
+                  <td colspan="7" class="empty-state">No stores match this view yet.</td>
+                </tr>
+              }
+            }
+          </tbody>
+        </table>
+      </div>
+      <div class="pagination">
+        <span
+          >{{ totalStores | number }} matching stores · page {{ currentPage }} of
+          {{ pageCount }}</span
+        >
+        <div>
+          <button
+            type="button"
+            (click)="changePage(currentPage - 1)"
+            [disabled]="currentPage <= 1 || storesLoading"
+          >
+            Previous
+          </button>
+          @for (link of pageLinks; track $index) {
+            @if (link.page === null) {
+              <span class="page-ellipsis" aria-hidden="true">{{ link.label }}</span>
+            } @else {
+              <button
+                type="button"
+                [attr.aria-label]="'Go to page ' + link.page"
+                [attr.aria-current]="currentPage === link.page ? 'page' : null"
+                [class.current-page]="currentPage === link.page"
+                (click)="changePage(link.page)"
+                [disabled]="storesLoading || currentPage === link.page"
+              >
+                {{ link.label }}
+              </button>
+            }
+          }
+          <button
+            type="button"
+            (click)="changePage(currentPage + 1)"
+            [disabled]="currentPage >= pageCount || storesLoading"
+          >
+            Next
+          </button>
+        </div>
+      </div>
+    </section>
+  } @else if (jobsLoading || selectedJobId !== null) {
+    <section class="panel empty-job">
+      <h2>Loading job details…</h2>
+    </section>
+  } @else {
+    <section class="panel empty-job">
+      <h2>No enrichment jobs yet</h2>
+      <p>Upload the provided stores CSV to create your first job and track its progress here.</p>
+    </section>
+  }
+</main>
