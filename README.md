@@ -76,6 +76,12 @@ npm start
 
 For development with automatic TypeScript reload, use `npm run dev` instead of the build/start commands. The API health endpoint is `http://localhost:4000/health`.
 
+### Inspect the SQLite database (optional)
+
+You can use [DB Browser for SQLite](https://sqlitebrowser.org/) to inspect the local database. With the default configuration, open `backend/data/tierforge.sqlite` after starting the backend. If you set `DATABASE_PATH` in `backend/.env`, open the database at that location instead (relative paths are resolved from the `backend` directory).
+
+Use the browser to inspect tables and query data. Avoid editing the database while the backend is running; the application owns updates to job and enrichment state.
+
 ### 3. Start the frontend
 
 In a third terminal, from the repository root:
