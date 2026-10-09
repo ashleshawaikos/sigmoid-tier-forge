@@ -46,6 +46,7 @@ export class App implements OnInit, OnDestroy {
   totalStores = 0;
   jobName = '';
   error = '';
+  scoringError = '';
   notice = '';
   busy = false;
   jobsLoading = false;
@@ -309,12 +310,13 @@ export class App implements OnInit, OnDestroy {
   }
 
   runScoring(): void {
+    this.scoringError = '';
     if (
       !this.activeJob ||
       this.activeJob.status !== 'completed' ||
       this.activeJob.enriched_stores === 0
     ) {
-      this.error = 'Data Not Available: scoring requires successfully enriched stores.';
+      this.scoringError = 'Data Not Available: scoring requires successfully enriched stores.';
       return;
     }
     if (
@@ -324,7 +326,7 @@ export class App implements OnInit, OnDestroy {
       ) ||
       Math.abs(this.weightTotal - 100) > 0.001
     ) {
-      this.error =
+      this.scoringError =
         'Metric bars must be non-negative and weights must be between 0 and 100%, totaling 100%.';
       return;
     }
@@ -333,7 +335,8 @@ export class App implements OnInit, OnDestroy {
       this.scoring.thresholds.Large > 100 ||
       this.scoring.thresholds.Medium < 0
     ) {
-      this.error = 'Tier thresholds must be between 0 and 100, with Large higher than Medium.';
+      this.scoringError =
+        'Tier thresholds must be between 0 and 100, with Large higher than Medium.';
       return;
     }
 
@@ -350,7 +353,7 @@ export class App implements OnInit, OnDestroy {
       },
       error: (error: unknown) => {
         this.scoringBusy = false;
-        this.error = this.errorMessage(error, 'Could not score this job.');
+        this.scoringError = this.errorMessage(error, 'Could not score this job.');
         this.changeDetector.markForCheck();
       },
     });

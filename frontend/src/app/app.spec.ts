@@ -52,6 +52,37 @@ describe('App', () => {
     fixture.destroy();
   });
 
+  it('shows scoring validation errors beside the scoring configuration', () => {
+    const fixture = TestBed.createComponent(App);
+    fixture.detectChanges();
+    httpTesting.expectOne('http://localhost:4000/api/jobs').flush({ data: { jobs: [] } });
+    const app = fixture.componentInstance;
+    app.activeJob = {
+      id: 1,
+      name: 'Scoring job',
+      status: 'completed',
+      total_stores: 1,
+      enriched_stores: 1,
+      failed_stores: 0,
+      pending_stores: 0,
+      tier_breakdown: { Large: 0, Medium: 0, Small: 0 },
+    };
+    app.scoring.thresholds.Large = 30;
+    app.scoring.thresholds.Medium = 40;
+
+    app.runScoring();
+    fixture.detectChanges();
+
+    const element = fixture.nativeElement as HTMLElement;
+    const scoringConfig = element.querySelector('.config-panel');
+    expect(scoringConfig?.querySelector('[role="alert"]')?.textContent).toContain(
+      'Tier thresholds must be between 0 and 100, with Large higher than Medium.',
+    );
+    expect(element.querySelector('main > [role="alert"]')).toBeNull();
+    expect(httpTesting.match((request) => request.url.endsWith('/score'))).toHaveLength(0);
+    fixture.destroy();
+  });
+
   it('refreshes the view when existing jobs arrive asynchronously', async () => {
     const fixture = TestBed.createComponent(App);
     fixture.componentInstance.selectedJobId = 42;
