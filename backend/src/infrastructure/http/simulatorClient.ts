@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import { config } from '../../config.js';
 import type { EnrichmentMetrics, StoreInput } from '../../lib/db.js';
+import { EnrichmentError } from './enrichmentError.js';
 import { HttpClient } from './httpClient.js';
 
 const responseSchema = z.object({
@@ -27,17 +28,35 @@ export class SimulatorClient {
 
   async enrich(store: SimulatorInput): Promise<EnrichmentMetrics> {
     await this.waitForTurn();
-    const response = await this.http.postJson<SimulatorInput, unknown>(
-      `${config.simulatorBaseUrl}/enrich`,
-      store,
-      this.timeoutMs,
-    );
+    let response;
+    try {
+      response = await this.http.postJson<SimulatorInput, unknown>(
+        `${config.simulatorBaseUrl}/enrich`,
+        store,
+        this.timeoutMs,
+      );
+    } catch (error) {
+      throw new EnrichmentError(
+        error instanceof Error ? error.message : 'Enrichment request failed.',
+        true,
+      );
+    }
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Enrichment API returned HTTP ${response.status}.`);
+      const retryable =
+        response.status === 408 ||
+        response.status === 429 ||
+        response.status >= 500;
+      throw new EnrichmentError(
+        `Enrichment API returned HTTP ${response.status}.`,
+        retryable,
+      );
     }
     const parsed = responseSchema.safeParse(response.body);
     if (!parsed.success || parsed.data.store_id !== store.store_id) {
-      throw new Error('Enrichment API returned an invalid response.');
+      throw new EnrichmentError(
+        'Enrichment API returned an invalid response.',
+        false,
+      );
     }
     return {
       estimated_monthly_footfall: parsed.data.estimated_monthly_footfall,

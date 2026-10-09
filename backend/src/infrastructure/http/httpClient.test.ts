@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { EnrichmentError } from './enrichmentError.js';
 import { HttpClient } from './httpClient.js';
 import { SimulatorClient } from './simulatorClient.js';
 
@@ -47,4 +48,31 @@ test('serializes outbound calls by the configured minimum interval', async () =>
 
   assert.equal(startedAt.length, 2);
   assert.ok(startedAt[1]! - startedAt[0]! >= 10);
+});
+
+test('classifies client errors as permanent and rate limits/server failures as retryable', async () => {
+  const input = {
+    store_id: 'ST001',
+    store_name: 'A',
+    address: '1 Main',
+    city: 'Delhi',
+    state: 'Delhi',
+  };
+
+  for (const [status, retryable] of [
+    [400, false],
+    [429, true],
+    [500, true],
+  ] as const) {
+    const client = new SimulatorClient(
+      new HttpClient(async () => new Response('{}', { status })),
+      0,
+      1000,
+    );
+    await assert.rejects(client.enrich(input), (error: unknown) => {
+      assert.ok(error instanceof EnrichmentError);
+      assert.equal(error.retryable, retryable);
+      return true;
+    });
+  }
 });

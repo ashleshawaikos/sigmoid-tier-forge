@@ -3,6 +3,7 @@ import { simulatorClient } from '../infrastructure/http/simulatorClient.js';
 import type { TierforgeRepository } from '../repositories/tierforgeRepository.js';
 import type { WorkItem } from '../repositories/tierforgeRepository.js';
 import type { SimulatorInput } from '../infrastructure/http/simulatorClient.js';
+import { isRetryableEnrichmentError } from '../infrastructure/http/enrichmentError.js';
 import { ApplicationError } from '../lib/applicationError.js';
 import { logger } from '../lib/logger.js';
 import { parseStoreCsv } from './csvService.js';
@@ -173,6 +174,7 @@ export class JobService {
 
   private async processStore(jobId: number, item: WorkItem): Promise<void> {
     const maxAttempts = this.options.maxAttempts ?? 5;
+    let permanentFailure = false;
     let lastError =
       item.attempt_count >= maxAttempts
         ? 'Backend restarted before the final attempt completed.'
@@ -202,6 +204,10 @@ export class JobService {
           maxAttempts,
           message: lastError,
         });
+        if (!isRetryableEnrichmentError(error)) {
+          permanentFailure = true;
+          break;
+        }
         if (count + 1 < maxAttempts) {
           const delay = Math.min(
             (this.options.backoffMs ?? 500) * 2 ** count,
@@ -215,17 +221,23 @@ export class JobService {
       return;
     }
     if (latestAttemptId !== undefined) {
+      const failureReason = permanentFailure
+        ? `Permanent enrichment failure: ${lastError}`
+        : `Failed after ${maxAttempts} attempts. Last error: ${lastError}`;
       const failed = this.repository.failStore(
         jobId,
         item.store_id,
         latestAttemptId,
-        `Failed after ${maxAttempts} attempts. Last error: ${lastError}`,
+        failureReason,
       );
       if (failed) {
         logger.error('job.store.failed', {
           jobId,
           storeId: item.store_id,
-          attempts: maxAttempts,
+          attempts: permanentFailure
+            ? item.attempt_count + 1
+            : maxAttempts,
+          permanentFailure,
           message: lastError,
         });
       }

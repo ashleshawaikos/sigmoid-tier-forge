@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { EnrichmentError } from '../infrastructure/http/enrichmentError.js';
 import { SqliteConnection } from '../lib/db.js';
 import { TierforgeRepository } from '../repositories/tierforgeRepository.js';
 import { JobService } from './jobService.js';
@@ -59,6 +60,39 @@ test('retries failed enrichment requests and completes the job', async () => {
     assert.equal(
       stores.items[0]?.estimated_monthly_footfall,
       metrics.estimated_monthly_footfall,
+    );
+  } finally {
+    connection.close();
+  }
+});
+
+test('does not retry a permanent enrichment failure', async () => {
+  const { connection, repository } = setup();
+  try {
+    const jobId = repository.createJob('permanent failure', [store]);
+    let calls = 0;
+    const service = new JobService(
+      repository,
+      {
+        enrich: async () => {
+          calls += 1;
+          throw new EnrichmentError('invalid enrichment response', false);
+        },
+      },
+      { workerCount: 1, maxAttempts: 5, backoffMs: 0 },
+    );
+
+    await service.runJob(jobId);
+
+    const summary = repository.getJobSummary(jobId);
+    const stores = repository.listStores(jobId, { page: 1, pageSize: 10 });
+    assert.equal(calls, 1);
+    assert.equal(summary?.status, 'failed');
+    assert.equal(summary?.failed_stores, 1);
+    assert.equal(stores.items[0]?.attempts, 1);
+    assert.equal(
+      stores.items[0]?.failure_reason,
+      'Permanent enrichment failure: invalid enrichment response',
     );
   } finally {
     connection.close();
