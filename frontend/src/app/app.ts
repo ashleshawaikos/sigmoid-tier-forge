@@ -47,6 +47,7 @@ export class App implements OnInit, OnDestroy {
   jobName = '';
   error = '';
   scoringError = '';
+  scoringNotice = '';
   notice = '';
   busy = false;
   jobsLoading = false;
@@ -189,6 +190,7 @@ export class App implements OnInit, OnDestroy {
     this.polling = undefined;
     this.selectedJobId = jobId;
     this.activeJob = null;
+    this.scoringNotice = '';
     this.stores = [];
     this.totalStores = 0;
     this.currentPage = 1;
@@ -311,6 +313,7 @@ export class App implements OnInit, OnDestroy {
 
   runScoring(): void {
     this.scoringError = '';
+    this.scoringNotice = '';
     if (
       !this.activeJob ||
       this.activeJob.status !== 'completed' ||
@@ -347,7 +350,7 @@ export class App implements OnInit, OnDestroy {
     this.api.scoreJob(jobId, this.scoring).subscribe({
       next: (result) => {
         this.scoringBusy = false;
-        this.notice = `Scoring complete for ${result.scoredStores.toLocaleString()} enriched stores.`;
+        this.scoringNotice = `Scoring complete for ${result.scoredStores.toLocaleString()} enriched stores.`;
         this.loadJobSnapshot(jobId);
         this.changeDetector.markForCheck();
       },

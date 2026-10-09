@@ -83,6 +83,52 @@ describe('App', () => {
     fixture.destroy();
   });
 
+  it('shows scoring success feedback below the scoring configuration', () => {
+    const fixture = TestBed.createComponent(App);
+    fixture.detectChanges();
+    httpTesting.expectOne('http://localhost:4000/api/jobs').flush({ data: { jobs: [] } });
+    const app = fixture.componentInstance;
+    app.selectedJobId = 1;
+    app.activeJob = {
+      id: 1,
+      name: 'Scoring job',
+      status: 'completed',
+      total_stores: 2,
+      enriched_stores: 2,
+      failed_stores: 0,
+      pending_stores: 0,
+      tier_breakdown: { Large: 0, Medium: 0, Small: 0 },
+    };
+
+    app.runScoring();
+    httpTesting.expectOne('http://localhost:4000/api/jobs/1/score').flush({
+      data: {
+        scoredStores: 2,
+        tierBreakdown: { Large: 1, Medium: 1, Small: 0 },
+        scoring: app.scoring,
+      },
+    });
+    httpTesting.expectOne('http://localhost:4000/api/jobs/1').flush({
+      data: {
+        job: {
+          ...app.activeJob,
+          tier_breakdown: { Large: 1, Medium: 1, Small: 0 },
+        },
+      },
+    });
+    httpTesting.expectOne('http://localhost:4000/api/jobs/1/stores?page=1&pageSize=25').flush({
+      data: { items: [], total: 2, page: 1, pageSize: 25 },
+    });
+    fixture.detectChanges();
+
+    const element = fixture.nativeElement as HTMLElement;
+    expect(element.querySelector('.config-panel [role="status"]')?.textContent).toContain(
+      'Scoring complete for 2 enriched stores.',
+    );
+    expect(element.querySelector('main > .alert.success')).toBeNull();
+    fixture.destroy();
+  });
+
   it('refreshes the view when existing jobs arrive asynchronously', async () => {
     const fixture = TestBed.createComponent(App);
     fixture.componentInstance.selectedJobId = 42;

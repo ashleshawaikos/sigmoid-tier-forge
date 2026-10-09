@@ -254,6 +254,9 @@
           @if (scoringError) {
             <div class="alert error" role="alert">{{ scoringError }}</div>
           }
+          @if (scoringNotice) {
+            <div class="alert success" role="status">{{ scoringNotice }}</div>
+          }
           <button class="primary-btn score-btn" (click)="runScoring()" [disabled]="scoringBusy">
             @if (scoringBusy) {
               <span class="loading-spinner" aria-hidden="true"></span>
