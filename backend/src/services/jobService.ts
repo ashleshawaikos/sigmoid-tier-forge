@@ -1,4 +1,5 @@
 import type { EnrichmentMetrics, StoreInput, Tier } from '../lib/db.js';
+import { EnrichmentCircuitBreaker } from '../infrastructure/resilience/enrichmentCircuitBreaker.js';
 import { simulatorClient } from '../infrastructure/http/simulatorClient.js';
 import type { TierforgeRepository } from '../repositories/tierforgeRepository.js';
 import type { WorkItem } from '../repositories/tierforgeRepository.js';
@@ -22,6 +23,7 @@ export class JobService {
       backoffMs?: number;
       maxBackoffMs?: number;
     } = {},
+    private readonly circuitBreaker = new EnrichmentCircuitBreaker(),
   ) {}
 
   createJob(name: string, stores: StoreInput[]): number {
@@ -54,6 +56,7 @@ export class JobService {
   async runJob(jobId: number): Promise<void> {
     const items = this.repository.listWorkItems(jobId);
     let nextIndex = 0;
+    let circuitBreakerBlocked = false;
     let completedItems = 0;
     const workerCount = Math.min(this.options.workerCount ?? 10, items.length);
     logger.info('job.processing.started', {
@@ -62,11 +65,15 @@ export class JobService {
       workerCount,
     });
     const workers = Array.from({ length: workerCount }, async () => {
-      while (nextIndex < items.length) {
+      while (nextIndex < items.length && !circuitBreakerBlocked) {
         const item = items[nextIndex];
         nextIndex += 1;
         if (item) {
-          await this.processStore(jobId, item);
+          const processed = await this.processStore(jobId, item);
+          if (!processed) {
+            circuitBreakerBlocked = true;
+            return;
+          }
           completedItems += 1;
           if (completedItems % 100 === 0 || completedItems === items.length) {
             logger.info('job.processing.progress', {
@@ -87,6 +94,12 @@ export class JobService {
           : 'Unexpected job worker failure.';
       logger.error('job.processing.worker_error', { jobId, message: reason });
       this.repository.failPending(jobId, `Job stopped: ${reason}`);
+    }
+    if (circuitBreakerBlocked) {
+      this.repository.failPending(
+        jobId,
+        `Enrichment service circuit breaker is ${this.circuitBreaker.getState()}. Remaining stores were not attempted.`,
+      );
     }
     this.repository.finishJob(jobId);
     const summary = this.repository.getJobSummary(jobId);
@@ -172,18 +185,33 @@ export class JobService {
     this.repository.finishJob(jobId);
   }
 
-  private async processStore(jobId: number, item: WorkItem): Promise<void> {
+  private async processStore(
+    jobId: number,
+    item: WorkItem,
+  ): Promise<boolean> {
     const maxAttempts = this.options.maxAttempts ?? 5;
     let permanentFailure = false;
     let lastError =
       item.attempt_count >= maxAttempts
         ? 'Backend restarted before the final attempt completed.'
         : 'Enrichment failed.';
+    let attemptsMade = item.attempt_count;
     let latestAttemptId: number | undefined =
       item.attempt_id > 0 ? item.attempt_id : undefined;
+    let blockedByCircuitBreaker = false;
     for (let count = item.attempt_count; count < maxAttempts; count += 1) {
+      const permit = this.circuitBreaker.acquirePermit();
+      if (!permit) {
+        if (latestAttemptId === undefined) return false;
+        blockedByCircuitBreaker = true;
+        break;
+      }
       const attemptId = this.repository.startAttempt(jobId, item.store_id);
-      if (attemptId === undefined) return;
+      if (attemptId === undefined) {
+        this.circuitBreaker.recordIgnoredFailure(permit);
+        return true;
+      }
+      attemptsMade += 1;
       latestAttemptId = attemptId;
       let metrics: EnrichmentMetrics;
       try {
@@ -195,17 +223,30 @@ export class JobService {
           state: item.state,
         });
       } catch (error) {
+        const retryable = isRetryableEnrichmentError(error);
+        let breakerOpened = false;
+        if (retryable) breakerOpened = this.circuitBreaker.recordFailure(permit);
+        else this.circuitBreaker.recordIgnoredFailure(permit);
         lastError =
           error instanceof Error ? error.message : 'Unknown enrichment error.';
         logger.warn('job.store.attempt_failed', {
           jobId,
           storeId: item.store_id,
-          attempt: count + 1,
+          attempt: attemptsMade,
           maxAttempts,
           message: lastError,
         });
-        if (!isRetryableEnrichmentError(error)) {
+        if (breakerOpened)
+          logger.error('job.circuit_breaker.opened', {
+            jobId,
+            state: this.circuitBreaker.getState(),
+          });
+        if (!retryable) {
           permanentFailure = true;
+          break;
+        }
+        if (this.circuitBreaker.getState() === 'open') {
+          blockedByCircuitBreaker = true;
           break;
         }
         if (count + 1 < maxAttempts) {
@@ -217,13 +258,19 @@ export class JobService {
         }
         continue;
       }
+      this.circuitBreaker.recordSuccess(permit);
       this.repository.completeAttempt(jobId, item.store_id, attemptId, metrics);
-      return;
+      return true;
     }
     if (latestAttemptId !== undefined) {
-      const failureReason = permanentFailure
-        ? `Permanent enrichment failure: ${lastError}`
-        : `Failed after ${maxAttempts} attempts. Last error: ${lastError}`;
+      let failureReason: string;
+      if (permanentFailure) {
+        failureReason = `Permanent enrichment failure: ${lastError}`;
+      } else if (blockedByCircuitBreaker) {
+        failureReason = `Enrichment service circuit breaker is ${this.circuitBreaker.getState()}. Last error: ${lastError}`;
+      } else {
+        failureReason = `Failed after ${maxAttempts} attempts. Last error: ${lastError}`;
+      }
       const failed = this.repository.failStore(
         jobId,
         item.store_id,
@@ -234,13 +281,12 @@ export class JobService {
         logger.error('job.store.failed', {
           jobId,
           storeId: item.store_id,
-          attempts: permanentFailure
-            ? item.attempt_count + 1
-            : maxAttempts,
+          attempts: attemptsMade,
           permanentFailure,
           message: lastError,
         });
       }
     }
+    return !blockedByCircuitBreaker;
   }
 }
