@@ -44,7 +44,15 @@ test('API supports upload, job progress, scoring, dashboard, and store results',
 
   const jobs = await fetch(`${baseUrl}/api/jobs`);
   assert.equal(jobs.status, 200);
+  assert.equal(jobs.headers.get('cache-control'), 'no-store');
+  assert.equal(jobs.headers.get('etag'), null);
   assert.deepEqual(await jobs.json(), { data: { jobs: [] } });
+
+  const refreshedJobs = await fetch(`${baseUrl}/api/jobs`, {
+    headers: { 'If-None-Match': '"cached-jobs"' },
+  });
+  assert.equal(refreshedJobs.status, 200);
+  assert.deepEqual(await refreshedJobs.json(), { data: { jobs: [] } });
 
   const invalid = await fetch(`${baseUrl}/api/jobs/invalid`);
   assert.equal(invalid.status, 400);

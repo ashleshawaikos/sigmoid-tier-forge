@@ -11,6 +11,7 @@ The application is a local modular monolith:
 - Job/scoring services own use-case coordination and domain rules.
 - A typed repository owns SQL queries and transactions; a SQLite connection wrapper owns initialization and schema migrations.
 - A simulator client uses a shared HTTP wrapper and enforces rate limiting, timeout, and response validation.
+- Multiple enrichment jobs can run concurrently; they share the simulator client's request rate limit.
 
 The SQLite schema tracks `jobs`, per-store `job_stores`, successful `enrichment_results`, one current `scoring_config` per job, and current `store_scores`. The database is created at `backend/data/tierforge.sqlite` by default. Existing data from the previous `store_results` schema is migrated when the backend starts.
 
@@ -19,6 +20,9 @@ The SQLite schema tracks `jobs`, per-store `job_stores`, successful `enrichment_
 - Node.js 24.15+ and npm 11.16.0 (the repository `.nvmrc` selects Node 24)
 - Python 3 and `venv` for the provided simulator
 - Committed npm lockfiles are used for repeatable installs (`npm ci`)
+- On Windows, install Visual Studio Build Tools with the **Desktop development with C++** workload (including the MSVC C++ build tools and a Windows SDK) so native dependencies such as `better-sqlite3` can build when a prebuilt binary is unavailable.
+
+If a Windows backend install fails with `MSB4019` and `Microsoft.Cpp.Default.props` missing, add the C++ workload in Visual Studio Installer, then reopen the terminal and rerun `npm ci` from `backend`.
 
 ## Run locally
 
@@ -55,7 +59,7 @@ nvm use
 cd backend
 npm ci
 cp .env.example .env  # first run only
-npm run dev
+npm start
 ```
 
 The API is ready when `http://localhost:4000/health` returns a `data.status` of `ok`. The database is created at `backend/data/tierforge.sqlite`. `DATABASE_PATH` in `backend/.env` is relative to the backend working directory unless it is absolute.

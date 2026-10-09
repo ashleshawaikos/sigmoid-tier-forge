@@ -1,5 +1,11 @@
 import { HttpErrorResponse } from '@angular/common/http';
-import { Component, HostListener, OnDestroy, OnInit } from '@angular/core';
+import {
+  ChangeDetectorRef,
+  Component,
+  HostListener,
+  OnDestroy,
+  OnInit,
+} from '@angular/core';
 import { Subject, Subscription, timer } from 'rxjs';
 import { debounceTime, exhaustMap, takeWhile } from 'rxjs/operators';
 
@@ -61,12 +67,16 @@ export class App implements OnInit, OnDestroy {
   private readonly searchChanges = new Subject<void>();
   private lastStoreRefreshKey = '';
 
-  constructor(private readonly api: TierforgeApiService) {}
+  constructor(
+    private readonly api: TierforgeApiService,
+    private readonly changeDetector: ChangeDetectorRef,
+  ) {}
 
   ngOnInit(): void {
     this.searchSubscription = this.searchChanges.pipe(debounceTime(300)).subscribe(() => {
       this.currentPage = 1;
       this.loadStores();
+      this.changeDetector.markForCheck();
     });
     this.loadJobs();
   }
@@ -137,10 +147,12 @@ export class App implements OnInit, OnDestroy {
         this.selectedStatus = '';
         this.selectJob(created.jobId);
         this.loadJobs();
+        this.changeDetector.markForCheck();
       },
       error: (error: unknown) => {
         this.busy = false;
         this.error = this.errorMessage(error, 'Could not start the enrichment job.');
+        this.changeDetector.markForCheck();
       },
     });
   }
@@ -152,6 +164,7 @@ export class App implements OnInit, OnDestroy {
         this.jobsLoading = false;
         this.jobs = jobs;
         if (this.selectedJobId === null && jobs.length) this.selectJob(jobs[0]!.id);
+        this.changeDetector.markForCheck();
       },
       error: (error: unknown) => {
         this.jobsLoading = false;
@@ -159,6 +172,7 @@ export class App implements OnInit, OnDestroy {
           error,
           'Could not connect to the backend. Confirm it is running on port 4000.',
         );
+        this.changeDetector.markForCheck();
       },
     });
   }
@@ -188,10 +202,12 @@ export class App implements OnInit, OnDestroy {
           if (job.status === 'completed' || job.status === 'failed') {
             this.loadJobs();
           }
+          this.changeDetector.markForCheck();
         },
         error: (error: unknown) => {
           this.error = this.errorMessage(error, `Could not load job #${jobId}.`);
           this.polling?.unsubscribe();
+          this.changeDetector.markForCheck();
         },
       });
   }
@@ -259,10 +275,12 @@ export class App implements OnInit, OnDestroy {
         this.scoringBusy = false;
         this.notice = `Scoring complete for ${result.scoredStores.toLocaleString()} enriched stores.`;
         this.loadJobSnapshot(jobId);
+        this.changeDetector.markForCheck();
       },
       error: (error: unknown) => {
         this.scoringBusy = false;
         this.error = this.errorMessage(error, 'Could not score this job.');
+        this.changeDetector.markForCheck();
       },
     });
   }
@@ -272,9 +290,11 @@ export class App implements OnInit, OnDestroy {
       next: (job) => {
         this.activeJob = job;
         this.loadStores();
+        this.changeDetector.markForCheck();
       },
       error: (error: unknown) => {
         this.error = this.errorMessage(error, 'Could not refresh the job summary.');
+        this.changeDetector.markForCheck();
       },
     });
   }
@@ -315,10 +335,12 @@ export class App implements OnInit, OnDestroy {
           this.storesLoading = false;
           this.stores = page.items;
           this.totalStores = page.total;
+          this.changeDetector.markForCheck();
         },
         error: (error: unknown) => {
           this.storesLoading = false;
           this.error = this.errorMessage(error, 'Could not load stores for this job.');
+          this.changeDetector.markForCheck();
         },
       });
   }

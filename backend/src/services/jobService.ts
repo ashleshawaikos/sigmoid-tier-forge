@@ -24,19 +24,9 @@ export class JobService {
   ) {}
 
   createJob(name: string, stores: StoreInput[]): number {
-    try {
-      const jobId = this.repository.createJob(name, stores);
-      logger.info('job.created', { jobId, totalStores: stores.length });
-      return jobId;
-    } catch (error) {
-      if (error instanceof Error && error.message === 'ACTIVE_JOB') {
-        throw new ApplicationError(
-          'ACTIVE_JOB',
-          'Only one enrichment job can run at a time. Wait for the active job to finish.',
-        );
-      }
-      throw error;
-    }
+    const jobId = this.repository.createJob(name, stores);
+    logger.info('job.created', { jobId, totalStores: stores.length });
+    return jobId;
   }
 
   createJobFromCsv(

@@ -17,7 +17,6 @@ const pageSchema = z.object({
   q: z.string().trim().max(100).optional(),
 });
 const applicationErrorStatuses: Record<ApplicationErrorCode, number> = {
-  ACTIVE_JOB: 409,
   INVALID_CSV: 400,
   INVALID_SCORING: 400,
   JOB_NOT_FOUND: 404,

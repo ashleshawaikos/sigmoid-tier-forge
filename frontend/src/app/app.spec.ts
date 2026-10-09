@@ -26,6 +26,33 @@ describe('App', () => {
     expect(element.textContent).toContain('No enrichment jobs yet');
   });
 
+  it('refreshes the view when existing jobs arrive asynchronously', async () => {
+    const fixture = TestBed.createComponent(App);
+    fixture.componentInstance.selectedJobId = 42;
+    fixture.detectChanges();
+
+    httpTesting.expectOne('http://localhost:4000/api/jobs').flush({
+      data: {
+        jobs: [
+          {
+            id: 7,
+            name: 'Existing stores',
+            status: 'completed',
+            total_stores: 1,
+            enriched_stores: 1,
+            failed_stores: 0,
+            pending_stores: 0,
+            tier_breakdown: { Large: 1, Medium: 0, Small: 0 },
+          },
+        ],
+      },
+    });
+    await fixture.whenStable();
+
+    expect(fixture.nativeElement.textContent).toContain('Existing stores');
+    fixture.destroy();
+  });
+
   it('shows validation feedback when upload is submitted without a file', () => {
     const fixture = TestBed.createComponent(App);
     fixture.detectChanges();

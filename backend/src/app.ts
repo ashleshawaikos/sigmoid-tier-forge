@@ -12,9 +12,14 @@ import jobRoutes from './routes/jobs.js';
 
 const app = express();
 
+app.disable('etag');
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
+app.use('/api', (_request, response, next) => {
+  response.setHeader('Cache-Control', 'no-store');
+  next();
+});
 app.use((request, response, next) => {
   const requestId = randomUUID();
   const startedAt = Date.now();

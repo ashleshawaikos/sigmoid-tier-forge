@@ -34,14 +34,6 @@ export class TierforgeRepository {
 
   createJob(name: string, stores: StoreInput[]): number {
     return this.connection.transaction(() => {
-      const active = this.connection
-        .prepare(
-          "SELECT id FROM jobs WHERE status IN ('queued', 'running') LIMIT 1",
-        )
-        .get();
-      if (active) {
-        throw new Error('ACTIVE_JOB');
-      }
       const result = this.connection
         .prepare(
           "INSERT INTO jobs (name, status, total_stores) VALUES (?, 'running', ?)",

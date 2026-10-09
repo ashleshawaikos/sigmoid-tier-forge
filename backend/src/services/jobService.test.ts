@@ -121,3 +121,45 @@ test('attempt fencing prevents a stale response from persisting metrics', () => 
     connection.close();
   }
 });
+
+test('runs multiple enrichment jobs concurrently', async () => {
+  const { connection, repository } = setup();
+  try {
+    const service = new JobService(
+      repository,
+      {
+        enrich: async () => {
+          inFlight += 1;
+          maximumInFlight = Math.max(maximumInFlight, inFlight);
+          if (inFlight === 2) signalBothStarted();
+          await new Promise<void>((resolve) => releases.push(resolve));
+          inFlight -= 1;
+          return metrics;
+        },
+      },
+      { workerCount: 1 },
+    );
+    let inFlight = 0;
+    let maximumInFlight = 0;
+    let signalBothStarted!: () => void;
+    const bothStarted = new Promise<void>((resolve) => {
+      signalBothStarted = resolve;
+    });
+    const releases: Array<() => void> = [];
+
+    const firstJobId = service.createJob('first job', [store]);
+    const secondJobId = service.createJob('second job', [store]);
+    const firstRun = service.runJob(firstJobId);
+    const secondRun = service.runJob(secondJobId);
+
+    await bothStarted;
+    assert.equal(maximumInFlight, 2);
+    for (const release of releases) release();
+    await Promise.all([firstRun, secondRun]);
+
+    assert.equal(repository.getJobSummary(firstJobId)?.status, 'completed');
+    assert.equal(repository.getJobSummary(secondJobId)?.status, 'completed');
+  } finally {
+    connection.close();
+  }
+});

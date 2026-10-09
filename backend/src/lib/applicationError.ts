@@ -1,5 +1,4 @@
 export type ApplicationErrorCode =
-  | 'ACTIVE_JOB'
   | 'INVALID_CSV'
   | 'INVALID_SCORING'
   | 'JOB_NOT_FOUND'
