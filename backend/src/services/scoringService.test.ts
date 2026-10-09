@@ -129,6 +129,16 @@ test('re-scoring replaces prior tiers using only stored enrichment metrics', () 
       repository.listStores(jobId, { page: 1, pageSize: 5 }).items[0]?.tier,
       'Small',
     );
+    assert.equal(
+      repository.listStores(jobId, { page: 1, pageSize: 5 }).items[0]?.score,
+      0,
+    );
+    const scoreTableCount = connection
+      .prepare(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'store_scores'",
+      )
+      .get() as { count: number };
+    assert.equal(scoreTableCount.count, 0);
   } finally {
     connection.close();
   }

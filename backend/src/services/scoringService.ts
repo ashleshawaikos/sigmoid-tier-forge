@@ -111,18 +111,16 @@ export class ScoringService {
         'Data not available: no stores were successfully enriched.',
       );
     }
-    const scores = scorableStores.map((store) => {
+    const tiers = scorableStores.map((store) => {
       const score = computeStoreScore(store, bars, weights);
-      return {
-        storeId: store.store_id,
-        score,
-        tier: determineTier(score, thresholds),
-      };
+      return determineTier(score, thresholds);
     });
-    this.repository.saveScores(jobId, parsed.data, scores);
+    this.repository.saveScoringConfig(jobId, parsed.data);
+    const tierBreakdown = { Large: 0, Medium: 0, Small: 0 };
+    for (const tier of tiers) tierBreakdown[tier] += 1;
     return {
-      scoredStores: scores.length,
-      tierBreakdown: this.repository.scoreBreakdown(jobId),
+      scoredStores: scorableStores.length,
+      tierBreakdown,
       scoring: parsed.data,
     };
   }

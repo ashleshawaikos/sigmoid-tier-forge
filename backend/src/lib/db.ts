@@ -38,16 +38,7 @@ export class SqliteConnection {
           )
           .get(name),
       );
-    if (
-      hasTable('store_scores') &&
-      (
-        this.database.pragma('foreign_key_list(store_scores)') as Array<{
-          table: string;
-        }>
-      ).some(
-        (foreignKey: { table: string }) => foreignKey.table === 'store_results',
-      )
-    ) {
+    if (hasTable('store_scores') && !hasTable('legacy_store_scores')) {
       this.database.exec(
         'ALTER TABLE store_scores RENAME TO legacy_store_scores',
       );
@@ -105,15 +96,15 @@ export class SqliteConnection {
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
-      CREATE TABLE IF NOT EXISTS store_scores (
+      CREATE TABLE IF NOT EXISTS legacy_store_scores (
         job_id INTEGER NOT NULL,
         store_id TEXT NOT NULL,
         score REAL NOT NULL CHECK (score >= 0 AND score <= 100),
         tier TEXT NOT NULL CHECK (tier IN ('Large', 'Medium', 'Small')),
-        PRIMARY KEY (job_id, store_id),
-        FOREIGN KEY (job_id, store_id) REFERENCES job_stores(job_id, store_id) ON DELETE CASCADE
+        PRIMARY KEY (job_id, store_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_store_scores_tier ON store_scores(job_id, tier);
+      CREATE INDEX IF NOT EXISTS idx_legacy_store_scores_tier
+        ON legacy_store_scores(job_id, tier);
     `);
 
     if (hasTable('store_results')) {
@@ -131,13 +122,6 @@ export class SqliteConnection {
           AND estimated_monthly_footfall IS NOT NULL
           AND estimated_monthly_revenue IS NOT NULL
           AND store_size_sqft IS NOT NULL;
-      `);
-    }
-    if (hasTable('legacy_store_scores')) {
-      this.database.exec(`
-        INSERT OR IGNORE INTO store_scores (job_id, store_id, score, tier)
-        SELECT job_id, store_id, score, tier FROM legacy_store_scores;
-        DROP TABLE legacy_store_scores;
       `);
     }
   }

@@ -8,6 +8,33 @@ import type {
   Tier,
 } from '../lib/db.js';
 
+const scoreExpression = `(
+  CASE WHEN e.estimated_monthly_footfall >= c.footfall_bar THEN c.footfall_weight ELSE 0 END +
+  CASE WHEN e.estimated_monthly_revenue >= c.revenue_bar THEN c.revenue_weight ELSE 0 END +
+  CASE WHEN e.store_size_sqft >= c.size_bar THEN c.size_weight ELSE 0 END
+)`;
+const scoredStoreRows = `
+  SELECT s.job_id, s.store_id, s.store_name, s.address, s.city, s.state, s.country,
+         s.status, s.attempt_count AS attempts, s.last_error AS failure_reason,
+         e.estimated_monthly_footfall, e.estimated_monthly_revenue, e.store_size_sqft,
+         CASE
+           WHEN c.job_id IS NULL THEN legacy.score
+           WHEN s.status = 'enriched' AND e.store_id IS NOT NULL THEN ${scoreExpression}
+           ELSE NULL
+         END AS score,
+         CASE
+           WHEN c.job_id IS NULL THEN legacy.tier
+           WHEN s.status != 'enriched' OR e.store_id IS NULL THEN NULL
+           WHEN ${scoreExpression} >= c.large_threshold THEN 'Large'
+           WHEN ${scoreExpression} >= c.medium_threshold THEN 'Medium'
+           ELSE 'Small'
+         END AS tier
+  FROM job_stores s
+  LEFT JOIN enrichment_results e ON e.job_id = s.job_id AND e.store_id = s.store_id
+  LEFT JOIN scoring_config c ON c.job_id = s.job_id
+  LEFT JOIN legacy_store_scores legacy ON legacy.job_id = s.job_id AND legacy.store_id = s.store_id
+`;
+
 export type WorkItem = StoreInput & {
   attempt_id: number;
   attempt_count: number;
@@ -260,18 +287,20 @@ export class TierforgeRepository {
       pageSize: number;
     },
   ): PageResult<StoreRow> {
-    const where = ['s.job_id = ?'];
+    const where = ['scored.job_id = ?'];
     const params: Array<string | number> = [jobId];
     if (filters.tier) {
-      where.push('sc.tier = ?');
+      where.push('scored.tier = ?');
       params.push(filters.tier);
     }
     if (filters.status) {
-      where.push('s.status = ?');
+      where.push('scored.status = ?');
       params.push(filters.status);
     }
     if (filters.query) {
-      where.push('(s.store_name LIKE ? OR s.store_id LIKE ? OR s.city LIKE ?)');
+      where.push(
+        '(scored.store_name LIKE ? OR scored.store_id LIKE ? OR scored.city LIKE ?)',
+      );
       const search = `%${filters.query}%`;
       params.push(search, search, search);
     }
@@ -281,8 +310,7 @@ export class TierforgeRepository {
         .prepare(
           `
       SELECT COUNT(*) AS count
-      FROM job_stores s LEFT JOIN store_scores sc
-        ON sc.job_id = s.job_id AND sc.store_id = s.store_id
+      FROM (${scoredStoreRows}) AS scored
       WHERE ${whereSql}
     `,
         )
@@ -291,15 +319,10 @@ export class TierforgeRepository {
     const rows = this.connection
       .prepare(
         `
-      SELECT s.job_id, s.store_id, s.store_name, s.address, s.city, s.state, s.country,
-             s.status, s.attempt_count AS attempts, s.last_error AS failure_reason,
-             e.estimated_monthly_footfall, e.estimated_monthly_revenue, e.store_size_sqft,
-             sc.score, sc.tier
-      FROM job_stores s
-      LEFT JOIN enrichment_results e ON e.job_id = s.job_id AND e.store_id = s.store_id
-      LEFT JOIN store_scores sc ON sc.job_id = s.job_id AND sc.store_id = s.store_id
+      SELECT scored.*
+      FROM (${scoredStoreRows}) AS scored
       WHERE ${whereSql}
-      ORDER BY s.store_name COLLATE NOCASE
+      ORDER BY scored.store_name COLLATE NOCASE
       LIMIT ? OFFSET ?
     `,
       )
@@ -329,19 +352,17 @@ export class TierforgeRepository {
       .all(jobId) as ScoredStore[];
   }
 
-  saveScores(
+  saveScoringConfig(
     jobId: number,
     config: {
       bars: Record<string, number>;
       weights: Record<string, number>;
       thresholds: { Large: number; Medium: number };
     },
-    scores: Array<{ storeId: string; score: number; tier: Tier }>,
   ): void {
-    this.connection.transaction(() => {
-      this.connection
-        .prepare(
-          `
+    this.connection
+      .prepare(
+        `
         INSERT INTO scoring_config
           (job_id, footfall_bar, revenue_bar, size_bar, footfall_weight, revenue_weight, size_weight,
            large_threshold, medium_threshold, updated_at)
@@ -353,34 +374,28 @@ export class TierforgeRepository {
           large_threshold = excluded.large_threshold, medium_threshold = excluded.medium_threshold,
           updated_at = datetime('now')
       `,
-        )
-        .run(
-          jobId,
-          config.bars['estimated_monthly_footfall'],
-          config.bars['estimated_monthly_revenue'],
-          config.bars['store_size_sqft'],
-          config.weights['estimated_monthly_footfall'],
-          config.weights['estimated_monthly_revenue'],
-          config.weights['store_size_sqft'],
-          config.thresholds.Large,
-          config.thresholds.Medium,
-        );
-      this.connection
-        .prepare('DELETE FROM store_scores WHERE job_id = ?')
-        .run(jobId);
-      const insert = this.connection.prepare(
-        'INSERT INTO store_scores (job_id, store_id, score, tier) VALUES (?, ?, ?, ?)',
+      )
+      .run(
+        jobId,
+        config.bars['estimated_monthly_footfall'],
+        config.bars['estimated_monthly_revenue'],
+        config.bars['store_size_sqft'],
+        config.weights['estimated_monthly_footfall'],
+        config.weights['estimated_monthly_revenue'],
+        config.weights['store_size_sqft'],
+        config.thresholds.Large,
+        config.thresholds.Medium,
       );
-      for (const item of scores)
-        insert.run(jobId, item.storeId, item.score, item.tier);
-    });
   }
 
   scoreBreakdown(jobId: number): Record<Tier, number> {
     const rows = this.connection
       .prepare(
         `
-      SELECT tier, COUNT(*) AS count FROM store_scores WHERE job_id = ? GROUP BY tier
+      SELECT tier, COUNT(*) AS count
+      FROM (${scoredStoreRows}) AS scored
+      WHERE job_id = ? AND tier IS NOT NULL
+      GROUP BY tier
     `,
       )
       .all(jobId) as Array<{ tier: Tier; count: number }>;
