@@ -93,14 +93,22 @@ export class TierforgeApiService {
       .pipe(map(({ data }) => data.job));
   }
 
+  retryFailedStores(jobId: number): Observable<{ job: Job; retriedStores: number }> {
+    return this.http
+      .post<ApiResponse<{ job: Job; retriedStores: number }>>(
+        `${this.baseUrl}/jobs/${jobId}/retry-failed`,
+        {},
+      )
+      .pipe(map(({ data }) => data));
+  }
+
   getStores(
     jobId: number,
-    filters: { tier?: Tier; status?: StoreStatus; query?: string; page: number; pageSize: number },
+    filters: { tier?: Tier; status?: StoreStatus; page: number; pageSize: number },
   ): Observable<StorePage> {
     let params = new HttpParams().set('page', filters.page).set('pageSize', filters.pageSize);
     if (filters.tier) params = params.set('tier', filters.tier);
     if (filters.status) params = params.set('status', filters.status);
-    if (filters.query) params = params.set('q', filters.query);
     return this.http
       .get<ApiResponse<StorePage>>(`${this.baseUrl}/jobs/${jobId}/stores`, { params })
       .pipe(map(({ data }) => data));

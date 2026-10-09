@@ -122,8 +122,48 @@ export class JobService {
     return this.repository.latestJobSummary();
   }
 
-  failInterruptedJobs(): void {
-    this.repository.failInterruptedJobs();
+  retryFailedStores(jobId: number): number {
+    const result = this.repository.retryFailedStores(jobId);
+    if (result.status === 'missing')
+      throw new ApplicationError('JOB_NOT_FOUND', 'Job not found.');
+    if (result.status === 'active')
+      throw new ApplicationError(
+        'JOB_ACTIVE',
+        'Wait for the current enrichment run to finish before retrying failed stores.',
+      );
+    if (result.status === 'none')
+      throw new ApplicationError(
+        'NO_FAILED_STORES',
+        'This job has no failed stores to retry.',
+      );
+
+    logger.info('job.failed_stores.retry_started', {
+      jobId,
+      retriedStores: result.count,
+    });
+    return result.count;
+  }
+
+  async resumeActiveJobs(): Promise<void> {
+    const jobIds = this.repository.listActiveJobIds();
+    if (jobIds.length === 0) return;
+
+    logger.info('job.recovery.started', { jobIds: jobIds.join(',') });
+    await Promise.all(
+      jobIds.map(async (jobId) => {
+        try {
+          await this.runJob(jobId);
+        } catch (error) {
+          logger.error('job.recovery.failed', {
+            jobId,
+            message:
+              error instanceof Error
+                ? error.message
+                : 'Unknown job recovery error.',
+          });
+        }
+      }),
+    );
   }
 
   failJob(jobId: number, reason: string): void {
@@ -133,9 +173,13 @@ export class JobService {
 
   private async processStore(jobId: number, item: WorkItem): Promise<void> {
     const maxAttempts = this.options.maxAttempts ?? 5;
-    let lastError = 'Enrichment failed.';
-    let latestAttemptId: number | undefined;
-    for (let count = 0; count < maxAttempts; count += 1) {
+    let lastError =
+      item.attempt_count >= maxAttempts
+        ? 'Backend restarted before the final attempt completed.'
+        : 'Enrichment failed.';
+    let latestAttemptId: number | undefined =
+      item.attempt_id > 0 ? item.attempt_id : undefined;
+    for (let count = item.attempt_count; count < maxAttempts; count += 1) {
       const attemptId = this.repository.startAttempt(jobId, item.store_id);
       if (attemptId === undefined) return;
       latestAttemptId = attemptId;

@@ -2,12 +2,14 @@ import { HttpErrorResponse } from '@angular/common/http';
 import {
   ChangeDetectorRef,
   Component,
+  ElementRef,
   HostListener,
   OnDestroy,
   OnInit,
+  ViewChild,
 } from '@angular/core';
-import { Subject, Subscription, timer } from 'rxjs';
-import { debounceTime, exhaustMap, takeWhile } from 'rxjs/operators';
+import { Subscription, timer } from 'rxjs';
+import { exhaustMap, takeWhile } from 'rxjs/operators';
 
 import {
   Job,
@@ -27,6 +29,8 @@ type ApiErrorBody = { error?: { message?: string; details?: Array<{ message?: st
   templateUrl: './app.html',
 })
 export class App implements OnInit, OnDestroy {
+  @ViewChild('fileInput') private fileInput?: ElementRef<HTMLInputElement>;
+
   readonly title = 'TierForge';
   readonly tiers: Tier[] = ['Large', 'Medium', 'Small'];
   readonly statuses: StoreStatus[] = ['pending', 'enriched', 'failed'];
@@ -38,7 +42,6 @@ export class App implements OnInit, OnDestroy {
   selectedJobId: number | null = null;
   selectedTier: Tier | '' = '';
   selectedStatus: StoreStatus | '' = '';
-  searchTerm = '';
   currentPage = 1;
   totalStores = 0;
   jobName = '';
@@ -48,6 +51,7 @@ export class App implements OnInit, OnDestroy {
   jobsLoading = false;
   storesLoading = false;
   scoringBusy = false;
+  retryBusy = false;
   readonly scoring: ScoringConfig = {
     bars: {
       estimated_monthly_footfall: 15000,
@@ -63,8 +67,7 @@ export class App implements OnInit, OnDestroy {
   };
 
   private polling?: Subscription;
-  private searchSubscription?: Subscription;
-  private readonly searchChanges = new Subject<void>();
+  private jobsPolling?: Subscription;
   private lastStoreRefreshKey = '';
 
   constructor(
@@ -73,23 +76,18 @@ export class App implements OnInit, OnDestroy {
   ) {}
 
   ngOnInit(): void {
-    this.searchSubscription = this.searchChanges.pipe(debounceTime(300)).subscribe(() => {
-      this.currentPage = 1;
-      this.loadStores();
-      this.changeDetector.markForCheck();
-    });
     this.loadJobs();
   }
 
   ngOnDestroy(): void {
     this.stopPolling();
-    this.searchSubscription?.unsubscribe();
   }
 
   @HostListener('window:pagehide')
   stopPolling(): void {
     this.polling?.unsubscribe();
     this.polling = undefined;
+    this.stopJobsPolling();
   }
 
   get weightTotal(): number {
@@ -141,6 +139,9 @@ export class App implements OnInit, OnDestroy {
     this.api.createJob(this.selectedFile, this.jobName.trim() || 'Store enrichment').subscribe({
       next: (created) => {
         this.busy = false;
+        this.selectedFile = null;
+        this.jobName = '';
+        if (this.fileInput) this.fileInput.nativeElement.value = '';
         this.notice = `Job #${created.jobId} accepted with ${created.totalStores.toLocaleString()} stores.`;
         this.currentPage = 1;
         this.selectedTier = '';
@@ -164,6 +165,11 @@ export class App implements OnInit, OnDestroy {
         this.jobsLoading = false;
         this.jobs = jobs;
         if (this.selectedJobId === null && jobs.length) this.selectJob(jobs[0]!.id);
+        if (jobs.some((job) => job.status === 'running' || job.status === 'queued')) {
+          this.startJobsPolling();
+        } else {
+          this.stopJobsPolling();
+        }
         this.changeDetector.markForCheck();
       },
       error: (error: unknown) => {
@@ -178,13 +184,22 @@ export class App implements OnInit, OnDestroy {
   }
 
   selectJob(jobId: number): void {
+    this.polling?.unsubscribe();
+    this.polling = undefined;
     this.selectedJobId = jobId;
     this.activeJob = null;
     this.stores = [];
     this.totalStores = 0;
     this.currentPage = 1;
     this.lastStoreRefreshKey = '';
-    this.polling?.unsubscribe();
+    const listedJob = this.jobs.find((job) => job.id === jobId);
+    if (listedJob && listedJob.status !== 'running' && listedJob.status !== 'queued') {
+      this.activeJob = listedJob;
+      this.loadStores();
+      this.changeDetector.markForCheck();
+      return;
+    }
+
     this.polling = timer(0, 4000)
       .pipe(
         exhaustMap(() => this.api.getJob(jobId)),
@@ -212,6 +227,66 @@ export class App implements OnInit, OnDestroy {
       });
   }
 
+  retryFailedStores(): void {
+    if (!this.activeJob || this.activeJob.failed_stores === 0 || this.retryBusy) return;
+
+    const jobId = this.activeJob.id;
+    this.error = '';
+    this.notice = '';
+    this.retryBusy = true;
+    this.api.retryFailedStores(jobId).subscribe({
+      next: ({ job, retriedStores }) => {
+        this.retryBusy = false;
+        this.jobs = this.jobs.map((listedJob) => (listedJob.id === jobId ? job : listedJob));
+        this.selectedStatus = '';
+        this.notice = `Retry started for ${retriedStores.toLocaleString()} failed stores.`;
+        this.selectJob(jobId);
+        this.changeDetector.markForCheck();
+      },
+      error: (error: unknown) => {
+        this.retryBusy = false;
+        this.error = this.errorMessage(error, 'Could not retry failed stores.');
+        this.changeDetector.markForCheck();
+      },
+    });
+  }
+
+  private startJobsPolling(): void {
+    if (this.jobsPolling && !this.jobsPolling.closed) return;
+
+    this.jobsPolling = timer(4000, 4000)
+      .pipe(
+        exhaustMap(() => this.api.listJobs()),
+        takeWhile(
+          (jobs) => jobs.some((job) => job.status === 'running' || job.status === 'queued'),
+          true,
+        ),
+      )
+      .subscribe({
+        next: (jobs) => {
+          this.jobs = jobs;
+          if (this.activeJob) {
+            const refreshed = jobs.find((job) => job.id === this.activeJob?.id);
+            if (refreshed) this.activeJob = refreshed;
+          }
+          this.changeDetector.markForCheck();
+        },
+        error: (error: unknown) => {
+          this.jobsPolling = undefined;
+          this.error = this.errorMessage(error, 'Could not refresh the job list.');
+          this.changeDetector.markForCheck();
+        },
+        complete: () => {
+          this.jobsPolling = undefined;
+        },
+      });
+  }
+
+  private stopJobsPolling(): void {
+    this.jobsPolling?.unsubscribe();
+    this.jobsPolling = undefined;
+  }
+
   setTierFilter(tier: unknown): void {
     this.selectedTier =
       typeof tier === 'string' ? (this.tiers.find((candidate) => candidate === tier) ?? '') : '';
@@ -228,10 +303,6 @@ export class App implements OnInit, OnDestroy {
     this.loadStores();
   }
 
-  searchStores(): void {
-    this.searchChanges.next();
-  }
-
   changePage(page: number): void {
     this.currentPage = Math.max(1, Math.min(this.pageCount, page));
     this.loadStores();
@@ -240,10 +311,10 @@ export class App implements OnInit, OnDestroy {
   runScoring(): void {
     if (
       !this.activeJob ||
-      this.activeJob.status === 'running' ||
-      this.activeJob.status === 'queued'
+      this.activeJob.status !== 'completed' ||
+      this.activeJob.enriched_stores === 0
     ) {
-      this.error = 'Scoring is available after enrichment finishes.';
+      this.error = 'Data Not Available: scoring requires successfully enriched stores.';
       return;
     }
     if (
@@ -313,7 +384,6 @@ export class App implements OnInit, OnDestroy {
       tiers: job.tier_breakdown,
       tier: this.selectedTier,
       storeStatus: this.selectedStatus,
-      query: this.searchTerm.trim(),
       page: this.currentPage,
     });
   }
@@ -326,7 +396,6 @@ export class App implements OnInit, OnDestroy {
       .getStores(this.selectedJobId, {
         tier: this.selectedTier || undefined,
         status: this.selectedStatus || undefined,
-        query: this.searchTerm.trim() || undefined,
         page: this.currentPage,
         pageSize: this.pageSize,
       })

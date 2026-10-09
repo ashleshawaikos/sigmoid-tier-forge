@@ -105,6 +105,17 @@ test('API supports upload, job progress, scoring, dashboard, and store results',
   }
   assert.equal(jobStatus, 'completed');
 
+  const noFailedStores = await fetch(
+    `${baseUrl}/api/jobs/${jobId}/retry-failed`,
+    { method: 'POST' },
+  );
+  assert.equal(noFailedStores.status, 409);
+  const noFailedStoresBody = (await noFailedStores.json()) as {
+    error: { code: string; message: string };
+  };
+  assert.equal(noFailedStoresBody.error.code, 'NO_FAILED_STORES');
+  assert.match(noFailedStoresBody.error.message, /no failed stores to retry/);
+
   const scoring = {
     bars: {
       estimated_monthly_footfall: 10000,

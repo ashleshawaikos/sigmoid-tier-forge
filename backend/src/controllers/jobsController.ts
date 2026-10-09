@@ -21,6 +21,8 @@ const applicationErrorStatuses: Record<ApplicationErrorCode, number> = {
   INVALID_SCORING: 400,
   JOB_NOT_FOUND: 404,
   JOB_ACTIVE: 409,
+  NO_FAILED_STORES: 409,
+  NO_ENRICHMENT_DATA: 409,
 };
 
 function mapApplicationError(error: unknown): never {
@@ -95,6 +97,36 @@ export const jobsController = {
     const job = jobService.getJob(jobId);
     if (!job) throw new ApiError(404, 'JOB_NOT_FOUND', 'Job not found.');
     response.json({ data: { job } });
+  },
+
+  retryFailed(request: Request, response: Response): void {
+    const jobId = parseJobId(request.params['jobId']);
+    let retriedStores: number;
+    try {
+      retriedStores = jobService.retryFailedStores(jobId);
+    } catch (error) {
+      mapApplicationError(error);
+    }
+    void jobService.runJob(jobId).catch((error: unknown) => {
+      console.error(`Retry for job ${jobId} failed unexpectedly:`, error);
+      try {
+        jobService.failJob(
+          jobId,
+          'Retry stopped because of an unexpected worker failure.',
+        );
+      } catch (persistenceError) {
+        console.error(
+          `Could not persist the terminal state for retry of job ${jobId}:`,
+          persistenceError,
+        );
+      }
+    });
+    response.status(202).json({
+      data: {
+        job: jobService.getJob(jobId),
+        retriedStores,
+      },
+    });
   },
 
   stores(request: Request, response: Response): void {

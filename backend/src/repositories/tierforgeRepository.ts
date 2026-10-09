@@ -67,6 +67,13 @@ export class TierforgeRepository {
     });
   }
 
+  listActiveJobIds(): number[] {
+    const rows = this.connection
+      .prepare("SELECT id FROM jobs WHERE status IN ('queued', 'running')")
+      .all() as Array<{ id: number }>;
+    return rows.map(({ id }) => id);
+  }
+
   getJobSummary(jobId: number): JobSummary | undefined {
     const job = this.getJob(jobId);
     if (!job) return undefined;
@@ -192,6 +199,42 @@ export class TierforgeRepository {
     this.refreshJobCounts(jobId);
   }
 
+  retryFailedStores(
+    jobId: number,
+  ):
+    | { status: 'missing' }
+    | { status: 'active' }
+    | { status: 'none' }
+    | { status: 'started'; count: number } {
+    return this.connection.transaction(() => {
+      const job = this.connection
+        .prepare('SELECT status FROM jobs WHERE id = ?')
+        .get(jobId) as { status: JobRow['status'] } | undefined;
+      if (!job) return { status: 'missing' };
+      if (job.status === 'running' || job.status === 'queued')
+        return { status: 'active' };
+
+      const result = this.connection
+        .prepare(
+          `
+          UPDATE job_stores
+          SET status = 'pending', attempt_count = 0, last_error = NULL
+          WHERE job_id = ? AND status = 'failed'
+        `,
+        )
+        .run(jobId);
+      if (result.changes === 0) return { status: 'none' };
+
+      this.connection
+        .prepare(
+          "UPDATE jobs SET status = 'running', updated_at = datetime('now') WHERE id = ?",
+        )
+        .run(jobId);
+      this.refreshJobCounts(jobId);
+      return { status: 'started', count: result.changes };
+    });
+  }
+
   finishJob(jobId: number): void {
     this.refreshJobCounts(jobId);
     const summary = this.getJobSummary(jobId);
@@ -205,25 +248,6 @@ export class TierforgeRepository {
         "UPDATE jobs SET status = ?, updated_at = datetime('now') WHERE id = ?",
       )
       .run(status, jobId);
-  }
-
-  failInterruptedJobs(): void {
-    const active = this.connection
-      .prepare("SELECT id FROM jobs WHERE status IN ('queued', 'running')")
-      .all() as Array<{ id: number }>;
-    this.connection.transaction(() => {
-      for (const { id } of active) {
-        this.failPending(
-          id,
-          'Backend restarted while this store was pending; job cannot resume automatically.',
-        );
-        this.connection
-          .prepare(
-            "UPDATE jobs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
-          )
-          .run(id);
-      }
-    });
   }
 
   listStores(

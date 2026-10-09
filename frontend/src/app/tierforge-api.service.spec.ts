@@ -34,17 +34,43 @@ describe('TierforgeApiService', () => {
     expect(createdId).toBe(8);
   });
 
-  it('sends store filtering and pagination to the API', () => {
+  it('sends status and tier filtering with pagination to the API', () => {
     api
-      .getStores(7, { tier: 'Large', status: 'failed', query: 'North', page: 2, pageSize: 25 })
+      .getStores(7, { tier: 'Large', status: 'failed', page: 2, pageSize: 25 })
       .subscribe((page) => expect(page.total).toBe(0));
     const request = httpTesting.expectOne(
       (candidate) => candidate.url === 'http://localhost:4000/api/jobs/7/stores',
     );
     expect(request.request.params.get('tier')).toBe('Large');
     expect(request.request.params.get('status')).toBe('failed');
-    expect(request.request.params.get('q')).toBe('North');
+    expect(request.request.params.has('q')).toBe(false);
     expect(request.request.params.get('page')).toBe('2');
     request.flush({ data: { items: [], total: 0, page: 2, pageSize: 25 } });
+  });
+
+  it('requests a retry of failed stores and unwraps the updated job', () => {
+    let retriedStores = 0;
+    api.retryFailedStores(7).subscribe((result) => {
+      retriedStores = result.retriedStores;
+      expect(result.job.status).toBe('running');
+    });
+    const request = httpTesting.expectOne('http://localhost:4000/api/jobs/7/retry-failed');
+    expect(request.request.method).toBe('POST');
+    request.flush({
+      data: {
+        job: {
+          id: 7,
+          name: 'Retry test',
+          status: 'running',
+          total_stores: 2,
+          enriched_stores: 1,
+          failed_stores: 0,
+          pending_stores: 1,
+          tier_breakdown: { Large: 1, Medium: 0, Small: 0 },
+        },
+        retriedStores: 1,
+      },
+    });
+    expect(retriedStores).toBe(1);
   });
 });

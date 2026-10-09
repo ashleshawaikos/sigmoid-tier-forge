@@ -96,8 +96,22 @@ export class ScoringService {
       );
     }
 
+    if (job.status !== 'completed') {
+      throw new ApplicationError(
+        'NO_ENRICHMENT_DATA',
+        'Data not available: no stores were successfully enriched.',
+      );
+    }
+
     const { bars, weights, thresholds } = parsed.data;
-    const scores = this.repository.listScorableStores(jobId).map((store) => {
+    const scorableStores = this.repository.listScorableStores(jobId);
+    if (scorableStores.length === 0) {
+      throw new ApplicationError(
+        'NO_ENRICHMENT_DATA',
+        'Data not available: no stores were successfully enriched.',
+      );
+    }
+    const scores = scorableStores.map((store) => {
       const score = computeStoreScore(store, bars, weights);
       return {
         storeId: store.store_id,

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { ApplicationError } from '../lib/applicationError.js';
 import { SqliteConnection } from '../lib/db.js';
 import { TierforgeRepository } from '../repositories/tierforgeRepository.js';
 import {
@@ -128,6 +129,56 @@ test('re-scoring replaces prior tiers using only stored enrichment metrics', () 
       repository.listStores(jobId, { page: 1, pageSize: 5 }).items[0]?.tier,
       'Small',
     );
+  } finally {
+    connection.close();
+  }
+});
+
+test('rejects scoring when every store failed enrichment', async () => {
+  const connection = new SqliteConnection(':memory:');
+  try {
+    const repository = new TierforgeRepository(connection);
+    const jobId = repository.createJob('no enrichment data', [
+      {
+        store_id: 'ST001',
+        store_name: 'Example',
+        address: '1 Main',
+        city: 'Delhi',
+        state: 'Delhi',
+        country: 'India',
+      },
+    ]);
+    const attemptId = repository.startAttempt(jobId, 'ST001');
+    assert.ok(attemptId !== undefined);
+    repository.failStore(jobId, 'ST001', attemptId, 'Failed after 1 attempt.');
+    repository.finishJob(jobId);
+    assert.equal(repository.getJobSummary(jobId)?.status, 'failed');
+
+    const scoring = new ScoringService(repository);
+    assert.throws(
+      () =>
+        scoring.scoreJob(jobId, {
+          bars: {
+            estimated_monthly_footfall: 100,
+            estimated_monthly_revenue: 100,
+            store_size_sqft: 100,
+          },
+          weights: {
+            estimated_monthly_footfall: 50,
+            estimated_monthly_revenue: 30,
+            store_size_sqft: 20,
+          },
+          thresholds: { Large: 70, Medium: 40 },
+        }),
+      (error: unknown) =>
+        error instanceof ApplicationError &&
+        error.code === 'NO_ENRICHMENT_DATA' &&
+        error.message ===
+          'Data not available: no stores were successfully enriched.',
+    );
+    assert.equal(repository.scoreBreakdown(jobId).Large, 0);
+    assert.equal(repository.scoreBreakdown(jobId).Medium, 0);
+    assert.equal(repository.scoreBreakdown(jobId).Small, 0);
   } finally {
     connection.close();
   }
