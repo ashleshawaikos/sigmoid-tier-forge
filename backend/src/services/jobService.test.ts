@@ -408,6 +408,108 @@ test('attempt fencing prevents a stale response from persisting metrics', () => 
   }
 });
 
+test('atomically claims work and reclaims an expired lease with a new fencing token', () => {
+  const { connection, repository } = setup();
+  try {
+    const jobId = repository.createJob('lease claim', [store]);
+    const firstClaim = repository.claimWorkItem(jobId, 3, 60_000);
+    assert.equal(firstClaim?.attempt_id, 1);
+    assert.equal(repository.claimWorkItem(jobId, 3, 60_000), undefined);
+
+    connection
+      .prepare('UPDATE job_stores SET lease_expires_at = ? WHERE job_id = ?')
+      .run(Date.now() - 1, jobId);
+    const reclaimed = repository.claimWorkItem(jobId, 3, 60_000);
+
+    assert.equal(reclaimed?.attempt_id, 2);
+    assert.equal(reclaimed?.attempt_count, 2);
+    assert.equal(
+      repository.completeAttempt(jobId, store.store_id, 1, metrics),
+      false,
+    );
+    assert.equal(
+      repository.completeAttempt(jobId, store.store_id, 2, metrics),
+      true,
+    );
+    assert.equal(repository.listScorableStores(jobId).length, 1);
+    const history = connection
+      .prepare(
+        'SELECT attempt_id, outcome, metrics_json FROM enrichment_attempts WHERE job_id = ? ORDER BY attempt_id',
+      )
+      .all(jobId) as Array<{
+      attempt_id: number;
+      outcome: string;
+      metrics_json: string | null;
+    }>;
+    assert.deepEqual(
+      history.map(({ attempt_id, outcome }) => [attempt_id, outcome]),
+      [
+        [1, 'abandoned'],
+        [2, 'succeeded'],
+      ],
+    );
+    assert.deepEqual(JSON.parse(history[1]!.metrics_json ?? '{}'), metrics);
+  } finally {
+    connection.close();
+  }
+});
+
+test('discards a late API response after an expired lease is reclaimed', async () => {
+  const { connection, repository } = setup();
+  try {
+    const jobId = repository.createJob('late response fencing', [store]);
+    let calls = 0;
+    let signalFirstCall!: () => void;
+    let returnFirstResponse!: (value: typeof metrics) => void;
+    const firstCallStarted = new Promise<void>((resolve) => {
+      signalFirstCall = resolve;
+    });
+    const firstResponse = new Promise<typeof metrics>((resolve) => {
+      returnFirstResponse = resolve;
+    });
+    const service = new JobService(
+      repository,
+      {
+        enrich: async () => {
+          calls += 1;
+          if (calls === 1) {
+            signalFirstCall();
+            return firstResponse;
+          }
+          return metrics;
+        },
+      },
+      { workerCount: 1, leaseMs: -1 },
+    );
+
+    const originalRun = service.runJob(jobId);
+    await firstCallStarted;
+    await service.runJob(jobId);
+    returnFirstResponse(metrics);
+    await originalRun;
+
+    const row = repository.listStores(jobId, { page: 1, pageSize: 5 }).items[0];
+    assert.equal(calls, 2);
+    assert.equal(row?.attempts, 2);
+    assert.equal(row?.status, 'enriched');
+    assert.equal(
+      row?.estimated_monthly_revenue,
+      metrics.estimated_monthly_revenue,
+    );
+    const history = connection
+      .prepare(
+        'SELECT attempt_id, outcome FROM enrichment_attempts WHERE job_id = ? ORDER BY attempt_id',
+      )
+      .all(jobId) as Array<{ attempt_id: number; outcome: string }>;
+    assert.deepEqual(history, [
+      { attempt_id: 1, outcome: 'abandoned' },
+      { attempt_id: 2, outcome: 'succeeded' },
+    ]);
+  } finally {
+    connection.close();
+  }
+});
+
 test('resumes pending stores from the persistent database without repeating completed work', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'tierforge-resume-'));
   const databasePath = join(directory, 'tierforge.sqlite');
@@ -524,6 +626,7 @@ test('runs multiple enrichment jobs concurrently', async () => {
     const bothStarted = new Promise<void>((resolve) => {
       signalBothStarted = resolve;
     });
+
     const releases: Array<() => void> = [];
 
     const firstJobId = service.createJob('first job', [store]);
@@ -538,6 +641,56 @@ test('runs multiple enrichment jobs concurrently', async () => {
 
     assert.equal(repository.getJobSummary(firstJobId)?.status, 'completed');
     assert.equal(repository.getJobSummary(secondJobId)?.status, 'completed');
+  } finally {
+    connection.close();
+  }
+});
+
+test('concurrent job runners claim distinct stores without duplicating enrichment calls', async () => {
+  const { connection, repository } = setup();
+  try {
+    const secondStore = {
+      ...store,
+      store_id: 'ST002',
+      store_name: 'North Store',
+    };
+    const jobId = repository.createJob('same-job concurrency', [
+      store,
+      secondStore,
+    ]);
+    const callsByStore = new Map<string, number>();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let signalBothStarted!: () => void;
+    const bothStarted = new Promise<void>((resolve) => {
+      signalBothStarted = resolve;
+    });
+    const releases: Array<() => void> = [];
+    const service = new JobService(
+      repository,
+      {
+        enrich: async ({ store_id }) => {
+          callsByStore.set(store_id, (callsByStore.get(store_id) ?? 0) + 1);
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          if (inFlight === 2) signalBothStarted();
+          await new Promise<void>((resolve) => releases.push(resolve));
+          inFlight -= 1;
+          return metrics;
+        },
+      },
+      { workerCount: 1, leaseMs: 60_000 },
+    );
+
+    const firstRun = service.runJob(jobId);
+    const secondRun = service.runJob(jobId);
+    await bothStarted;
+    for (const release of releases) release();
+    await Promise.all([firstRun, secondRun]);
+
+    assert.equal(maxInFlight, 2);
+    assert.deepEqual([...callsByStore.values()], [1, 1]);
+    assert.equal(repository.getJobSummary(jobId)?.status, 'completed');
   } finally {
     connection.close();
   }

@@ -1,5 +1,8 @@
 import type { EnrichmentMetrics, StoreInput, Tier } from '../lib/db.js';
-import { EnrichmentCircuitBreaker } from '../infrastructure/resilience/enrichmentCircuitBreaker.js';
+import {
+  EnrichmentCircuitBreaker,
+  type CircuitBreakerPermit,
+} from '../infrastructure/resilience/enrichmentCircuitBreaker.js';
 import { simulatorClient } from '../infrastructure/http/simulatorClient.js';
 import type { TierforgeRepository } from '../repositories/tierforgeRepository.js';
 import type { WorkItem } from '../repositories/tierforgeRepository.js';
@@ -22,6 +25,8 @@ export class JobService {
       maxAttempts?: number;
       backoffMs?: number;
       maxBackoffMs?: number;
+      leaseMs?: number;
+      leasePollMs?: number;
     } = {},
     private readonly circuitBreaker = new EnrichmentCircuitBreaker(),
   ) {}
@@ -54,34 +59,56 @@ export class JobService {
   }
 
   async runJob(jobId: number): Promise<void> {
-    const items = this.repository.listWorkItems(jobId);
-    let nextIndex = 0;
+    const maxAttempts = this.options.maxAttempts ?? 5;
+    const leaseMs = this.options.leaseMs ?? 30_000;
+    const workerCount = Math.min(
+      this.options.workerCount ?? 10,
+      Math.max(1, this.repository.getJob(jobId)?.total_stores ?? 1),
+    );
     let circuitBreakerBlocked = false;
-    let completedItems = 0;
-    const workerCount = Math.min(this.options.workerCount ?? 10, items.length);
     logger.info('job.processing.started', {
       jobId,
-      totalStores: items.length,
+      totalStores: this.repository.getJob(jobId)?.total_stores ?? 0,
       workerCount,
     });
     const workers = Array.from({ length: workerCount }, async () => {
-      while (nextIndex < items.length && !circuitBreakerBlocked) {
-        const item = items[nextIndex];
-        nextIndex += 1;
-        if (item) {
-          const processed = await this.processStore(jobId, item);
-          if (!processed) {
-            circuitBreakerBlocked = true;
-            return;
+      while (!circuitBreakerBlocked) {
+        const permit = this.circuitBreaker.acquirePermit();
+        if (!permit) {
+          if (this.circuitBreaker.getState() === 'half-open') {
+            await new Promise<void>((resolve) =>
+              setTimeout(resolve, this.options.leasePollMs ?? 25),
+            );
+            continue;
           }
-          completedItems += 1;
-          if (completedItems % 100 === 0 || completedItems === items.length) {
-            logger.info('job.processing.progress', {
-              jobId,
-              processedStores: completedItems,
-              totalStores: items.length,
-            });
-          }
+          circuitBreakerBlocked = true;
+          return;
+        }
+
+        let item: WorkItem | undefined;
+        try {
+          item = this.repository.claimWorkItem(jobId, maxAttempts, leaseMs);
+        } catch (error) {
+          this.circuitBreaker.recordIgnoredFailure(permit);
+          throw error;
+        }
+        if (!item) {
+          this.circuitBreaker.recordIgnoredFailure(permit);
+          if (!this.repository.hasPendingWork(jobId)) return;
+          await new Promise<void>((resolve) =>
+            setTimeout(resolve, this.options.leasePollMs ?? 25),
+          );
+          continue;
+        }
+        const processed = await this.processStore(
+          jobId,
+          item,
+          maxAttempts,
+          permit,
+        );
+        if (!processed) {
+          circuitBreakerBlocked = true;
+          return;
         }
       }
     });
@@ -188,105 +215,115 @@ export class JobService {
   private async processStore(
     jobId: number,
     item: WorkItem,
+    maxAttempts: number,
+    permit: CircuitBreakerPermit,
   ): Promise<boolean> {
-    const maxAttempts = this.options.maxAttempts ?? 5;
-    let permanentFailure = false;
-    let lastError =
-      item.attempt_count >= maxAttempts
-        ? 'Backend restarted before the final attempt completed.'
-        : 'Enrichment failed.';
-    let attemptsMade = item.attempt_count;
-    let latestAttemptId: number | undefined =
-      item.attempt_id > 0 ? item.attempt_id : undefined;
-    let blockedByCircuitBreaker = false;
-    for (let count = item.attempt_count; count < maxAttempts; count += 1) {
-      const permit = this.circuitBreaker.acquirePermit();
-      if (!permit) {
-        if (latestAttemptId === undefined) return false;
-        blockedByCircuitBreaker = true;
-        break;
+    let metrics: EnrichmentMetrics;
+    try {
+      metrics = await this.enrichment.enrich({
+        store_id: item.store_id,
+        store_name: item.store_name,
+        address: item.address,
+        city: item.city,
+        state: item.state,
+      });
+    } catch (error) {
+      const retryable = isRetryableEnrichmentError(error);
+      let breakerOpened = false;
+      if (retryable) breakerOpened = this.circuitBreaker.recordFailure(permit);
+      else this.circuitBreaker.recordIgnoredFailure(permit);
+      const message =
+        error instanceof Error ? error.message : 'Unknown enrichment error.';
+      logger.warn('job.store.attempt_failed', {
+        jobId,
+        storeId: item.store_id,
+        attempt: item.attempt_count,
+        maxAttempts,
+        message,
+      });
+      if (breakerOpened) {
+        logger.error('job.circuit_breaker.opened', {
+          jobId,
+          state: this.circuitBreaker.getState(),
+        });
       }
-      const attemptId = this.repository.startAttempt(jobId, item.store_id);
-      if (attemptId === undefined) {
-        this.circuitBreaker.recordIgnoredFailure(permit);
+      if (!retryable) {
+        const reason = `Permanent enrichment failure: ${message}`;
+        const failed = this.repository.failStore(
+          jobId,
+          item.store_id,
+          item.attempt_id,
+          reason,
+          'permanent_failure',
+        );
+        if (failed) {
+          logger.error('job.store.failed', {
+            jobId,
+            storeId: item.store_id,
+            attempts: item.attempt_count,
+            permanentFailure: true,
+            message,
+          });
+        }
         return true;
       }
-      attemptsMade += 1;
-      latestAttemptId = attemptId;
-      let metrics: EnrichmentMetrics;
-      try {
-        metrics = await this.enrichment.enrich({
-          store_id: item.store_id,
-          store_name: item.store_name,
-          address: item.address,
-          city: item.city,
-          state: item.state,
-        });
-      } catch (error) {
-        const retryable = isRetryableEnrichmentError(error);
-        let breakerOpened = false;
-        if (retryable) breakerOpened = this.circuitBreaker.recordFailure(permit);
-        else this.circuitBreaker.recordIgnoredFailure(permit);
-        lastError =
-          error instanceof Error ? error.message : 'Unknown enrichment error.';
-        logger.warn('job.store.attempt_failed', {
+      if (this.circuitBreaker.getState() === 'open') {
+        this.repository.failStore(
           jobId,
-          storeId: item.store_id,
-          attempt: attemptsMade,
-          maxAttempts,
-          message: lastError,
-        });
-        if (breakerOpened)
-          logger.error('job.circuit_breaker.opened', {
+          item.store_id,
+          item.attempt_id,
+          `Enrichment service circuit breaker opened. Last error: ${message}`,
+        );
+        return false;
+      }
+      if (item.attempt_count >= maxAttempts) {
+        const reason = `Failed after ${maxAttempts} attempts. Last error: ${message}`;
+        const failed = this.repository.failStore(
+          jobId,
+          item.store_id,
+          item.attempt_id,
+          reason,
+          'retry_exhausted',
+        );
+        if (failed) {
+          logger.error('job.store.failed', {
             jobId,
-            state: this.circuitBreaker.getState(),
+            storeId: item.store_id,
+            attempts: item.attempt_count,
+            message,
           });
-        if (!retryable) {
-          permanentFailure = true;
-          break;
         }
-        if (this.circuitBreaker.getState() === 'open') {
-          blockedByCircuitBreaker = true;
-          break;
-        }
-        if (count + 1 < maxAttempts) {
-          const delay = Math.min(
-            (this.options.backoffMs ?? 500) * 2 ** count,
-            this.options.maxBackoffMs ?? 8_000,
-          );
-          await new Promise<void>((resolve) => setTimeout(resolve, delay));
-        }
-        continue;
+        return true;
       }
-      this.circuitBreaker.recordSuccess(permit);
-      this.repository.completeAttempt(jobId, item.store_id, attemptId, metrics);
-      return true;
-    }
-    if (latestAttemptId !== undefined) {
-      let failureReason: string;
-      if (permanentFailure) {
-        failureReason = `Permanent enrichment failure: ${lastError}`;
-      } else if (blockedByCircuitBreaker) {
-        failureReason = `Enrichment service circuit breaker is ${this.circuitBreaker.getState()}. Last error: ${lastError}`;
-      } else {
-        failureReason = `Failed after ${maxAttempts} attempts. Last error: ${lastError}`;
-      }
-      const failed = this.repository.failStore(
+
+      const delay = Math.min(
+        (this.options.backoffMs ?? 500) * 2 ** (item.attempt_count - 1),
+        this.options.maxBackoffMs ?? 8_000,
+      );
+      this.repository.deferAttempt(
         jobId,
         item.store_id,
-        latestAttemptId,
-        failureReason,
+        item.attempt_id,
+        message,
+        delay,
       );
-      if (failed) {
-        logger.error('job.store.failed', {
-          jobId,
-          storeId: item.store_id,
-          attempts: attemptsMade,
-          permanentFailure,
-          message: lastError,
-        });
-      }
+      return true;
     }
-    return !blockedByCircuitBreaker;
+
+    this.circuitBreaker.recordSuccess(permit);
+    const completed = this.repository.completeAttempt(
+      jobId,
+      item.store_id,
+      item.attempt_id,
+      metrics,
+    );
+    if (!completed) {
+      logger.warn('job.store.stale_result_discarded', {
+        jobId,
+        storeId: item.store_id,
+        attemptId: item.attempt_id,
+      });
+    }
+    return true;
   }
 }

@@ -140,23 +140,134 @@ export class TierforgeRepository {
       .all(jobId) as WorkItem[];
   }
 
-  startAttempt(jobId: number, storeId: string): number | undefined {
-    const result = this.connection
-      .prepare(
-        `
+  claimWorkItem(
+    jobId: number,
+    maxAttempts: number,
+    leaseMs: number,
+  ): WorkItem | undefined {
+    return this.connection.transaction(() => {
+      const exhausted = this.connection
+        .prepare(
+          `
+        UPDATE job_stores
+        SET status = 'failed',
+            last_error = 'Failed after ' || CAST(? AS INTEGER) || ' attempts. Last error: ' ||
+              COALESCE(last_error, 'Worker lease expired after the final attempt.'),
+            lease_expires_at = NULL
+        WHERE job_id = ? AND status = 'pending' AND attempt_count >= ?
+          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+      `,
+        )
+        .run(maxAttempts, jobId, maxAttempts, Date.now());
+      if (exhausted.changes > 0) {
+        this.connection
+          .prepare(
+            `
+          UPDATE enrichment_attempts
+          SET outcome = 'abandoned', completed_at = datetime('now'),
+              error_message = COALESCE(error_message, 'Worker lease expired after the final attempt.')
+          WHERE job_id = ? AND outcome = 'running'
+            AND EXISTS (
+              SELECT 1 FROM job_stores s
+              WHERE s.job_id = enrichment_attempts.job_id
+                AND s.store_id = enrichment_attempts.store_id
+                AND s.attempt_id = enrichment_attempts.attempt_id
+                AND s.status = 'failed'
+            )
+        `,
+          )
+          .run(jobId);
+        this.refreshJobCounts(jobId);
+      }
+
+      const claimed = this.connection
+        .prepare(
+          `
       UPDATE job_stores
-      SET attempt_count = attempt_count + 1, attempt_id = attempt_id + 1
-      WHERE job_id = ? AND store_id = ? AND status = 'pending'
-    `,
+      SET attempt_count = attempt_count + 1,
+          attempt_id = attempt_id + 1,
+          lease_expires_at = ?,
+          last_error = NULL
+      WHERE rowid = (
+        SELECT rowid FROM job_stores
+        WHERE job_id = ? AND status = 'pending' AND attempt_count < ?
+          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+        ORDER BY rowid LIMIT 1
       )
-      .run(jobId, storeId);
-    if (result.changes === 0) return undefined;
+        AND status = 'pending'
+        AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+      RETURNING store_id, store_name, address, city, state, country, attempt_id, attempt_count
+    `,
+        )
+        .get(
+          Date.now() + leaseMs,
+          jobId,
+          maxAttempts,
+          Date.now(),
+          Date.now(),
+        ) as WorkItem | undefined;
+      if (claimed) {
+        this.connection
+          .prepare(
+            `
+          UPDATE enrichment_attempts
+          SET outcome = 'abandoned', completed_at = datetime('now'),
+              error_message = 'Worker lease expired before the attempt completed.'
+          WHERE job_id = ? AND store_id = ? AND attempt_id = ?
+            AND outcome = 'running'
+        `,
+          )
+          .run(jobId, claimed.store_id, claimed.attempt_id - 1);
+        this.connection
+          .prepare(
+            `
+          INSERT INTO enrichment_attempts (job_id, store_id, attempt_id, outcome)
+          VALUES (?, ?, ?, 'running')
+        `,
+          )
+          .run(jobId, claimed.store_id, claimed.attempt_id);
+      }
+      return claimed;
+    });
+  }
+
+  hasPendingWork(jobId: number): boolean {
     const row = this.connection
       .prepare(
-        'SELECT attempt_id FROM job_stores WHERE job_id = ? AND store_id = ?',
+        "SELECT 1 FROM job_stores WHERE job_id = ? AND status = 'pending' LIMIT 1",
       )
-      .get(jobId, storeId) as { attempt_id: number };
-    return row.attempt_id;
+      .get(jobId);
+    return row !== undefined;
+  }
+
+  startAttempt(jobId: number, storeId: string): number | undefined {
+    return this.connection.transaction(() => {
+      const result = this.connection
+        .prepare(
+          `
+      UPDATE job_stores
+      SET attempt_count = attempt_count + 1, attempt_id = attempt_id + 1,
+          lease_expires_at = NULL
+      WHERE job_id = ? AND store_id = ? AND status = 'pending'
+    `,
+        )
+        .run(jobId, storeId);
+      if (result.changes === 0) return undefined;
+      const row = this.connection
+        .prepare(
+          'SELECT attempt_id FROM job_stores WHERE job_id = ? AND store_id = ?',
+        )
+        .get(jobId, storeId) as { attempt_id: number };
+      this.connection
+        .prepare(
+          `
+        INSERT INTO enrichment_attempts (job_id, store_id, attempt_id, outcome)
+        VALUES (?, ?, ?, 'running')
+      `,
+        )
+        .run(jobId, storeId, row.attempt_id);
+      return row.attempt_id;
+    });
   }
 
   completeAttempt(
@@ -169,7 +280,8 @@ export class TierforgeRepository {
       const updated = this.connection
         .prepare(
           `
-        UPDATE job_stores SET status = 'enriched', last_error = NULL
+        UPDATE job_stores
+        SET status = 'enriched', last_error = NULL, lease_expires_at = NULL
         WHERE job_id = ? AND store_id = ? AND status = 'pending' AND attempt_id = ?
       `,
         )
@@ -190,6 +302,15 @@ export class TierforgeRepository {
           metrics.estimated_monthly_revenue,
           metrics.store_size_sqft,
         );
+      this.connection
+        .prepare(
+          `
+        UPDATE enrichment_attempts
+        SET outcome = 'succeeded', completed_at = datetime('now'), metrics_json = ?
+        WHERE job_id = ? AND store_id = ? AND attempt_id = ?
+      `,
+        )
+        .run(JSON.stringify(metrics), jobId, storeId, attemptId);
       this.refreshJobCounts(jobId);
       return true;
     });
@@ -200,17 +321,59 @@ export class TierforgeRepository {
     storeId: string,
     attemptId: number,
     reason: string,
+    outcome: 'permanent_failure' | 'retry_exhausted' = 'retry_exhausted',
   ): boolean {
     const result = this.connection
       .prepare(
         `
       UPDATE job_stores
-      SET status = 'failed', last_error = ?
+      SET status = 'failed', last_error = ?, lease_expires_at = NULL
       WHERE job_id = ? AND store_id = ? AND status = 'pending' AND attempt_id = ?
     `,
       )
       .run(reason, jobId, storeId, attemptId);
     this.refreshJobCounts(jobId);
+    if (result.changes > 0) {
+      this.connection
+        .prepare(
+          `
+        UPDATE enrichment_attempts
+        SET outcome = ?, completed_at = datetime('now'), error_message = ?
+        WHERE job_id = ? AND store_id = ? AND attempt_id = ?
+      `,
+        )
+        .run(outcome, reason, jobId, storeId, attemptId);
+    }
+    return result.changes > 0;
+  }
+
+  deferAttempt(
+    jobId: number,
+    storeId: string,
+    attemptId: number,
+    reason: string,
+    retryAfterMs: number,
+  ): boolean {
+    const result = this.connection
+      .prepare(
+        `
+      UPDATE job_stores
+      SET last_error = ?, lease_expires_at = ?
+      WHERE job_id = ? AND store_id = ? AND status = 'pending' AND attempt_id = ?
+    `,
+      )
+      .run(reason, Date.now() + retryAfterMs, jobId, storeId, attemptId);
+    if (result.changes > 0) {
+      this.connection
+        .prepare(
+          `
+        UPDATE enrichment_attempts
+        SET outcome = 'retryable_failure', completed_at = datetime('now'), error_message = ?
+        WHERE job_id = ? AND store_id = ? AND attempt_id = ?
+      `,
+        )
+        .run(reason, jobId, storeId, attemptId);
+    }
     return result.changes > 0;
   }
 
@@ -218,7 +381,17 @@ export class TierforgeRepository {
     this.connection
       .prepare(
         `
-      UPDATE job_stores SET status = 'failed', last_error = ?
+      UPDATE enrichment_attempts
+      SET outcome = 'abandoned', completed_at = datetime('now'), error_message = ?
+      WHERE job_id = ? AND outcome = 'running'
+    `,
+      )
+      .run(reason, jobId);
+    this.connection
+      .prepare(
+        `
+      UPDATE job_stores
+      SET status = 'failed', last_error = ?, lease_expires_at = NULL
       WHERE job_id = ? AND status = 'pending'
     `,
       )
@@ -245,7 +418,8 @@ export class TierforgeRepository {
         .prepare(
           `
           UPDATE job_stores
-          SET status = 'pending', attempt_count = 0, last_error = NULL
+          SET status = 'pending', attempt_count = 0, last_error = NULL,
+              lease_expires_at = NULL
           WHERE job_id = ? AND status = 'failed'
         `,
         )
@@ -266,10 +440,8 @@ export class TierforgeRepository {
     this.refreshJobCounts(jobId);
     const summary = this.getJobSummary(jobId);
     if (!summary) return;
-    const status =
-      summary.pending_stores === 0 && summary.enriched_stores === 0
-        ? 'failed'
-        : 'completed';
+    if (summary.pending_stores > 0) return;
+    const status = summary.enriched_stores === 0 ? 'failed' : 'completed';
     this.connection
       .prepare(
         "UPDATE jobs SET status = ?, updated_at = datetime('now') WHERE id = ?",

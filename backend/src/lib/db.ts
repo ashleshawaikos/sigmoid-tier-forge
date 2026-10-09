@@ -67,10 +67,26 @@ export class SqliteConnection {
         status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'enriched', 'failed')),
         attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
         attempt_id INTEGER NOT NULL DEFAULT 0 CHECK (attempt_id >= 0),
+        lease_expires_at INTEGER,
         last_error TEXT,
         PRIMARY KEY (job_id, store_id)
       );
       CREATE INDEX IF NOT EXISTS idx_job_stores_status ON job_stores(job_id, status);
+
+      CREATE TABLE IF NOT EXISTS enrichment_attempts (
+        job_id INTEGER NOT NULL,
+        store_id TEXT NOT NULL,
+        attempt_id INTEGER NOT NULL,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT,
+        outcome TEXT NOT NULL CHECK (
+          outcome IN ('running', 'succeeded', 'retryable_failure', 'permanent_failure', 'retry_exhausted', 'abandoned')
+        ),
+        error_message TEXT,
+        metrics_json TEXT,
+        PRIMARY KEY (job_id, store_id, attempt_id),
+        FOREIGN KEY (job_id, store_id) REFERENCES job_stores(job_id, store_id) ON DELETE CASCADE
+      );
 
       CREATE TABLE IF NOT EXISTS enrichment_results (
         job_id INTEGER NOT NULL,
@@ -106,6 +122,15 @@ export class SqliteConnection {
       CREATE INDEX IF NOT EXISTS idx_legacy_store_scores_tier
         ON legacy_store_scores(job_id, tier);
     `);
+
+    const jobStoreColumns = this.database
+      .prepare('PRAGMA table_info(job_stores)')
+      .all() as Array<{ name: string }>;
+    if (!jobStoreColumns.some((column) => column.name === 'lease_expires_at')) {
+      this.database.exec(
+        'ALTER TABLE job_stores ADD COLUMN lease_expires_at INTEGER',
+      );
+    }
 
     if (hasTable('store_results')) {
       this.database.exec(`

@@ -77,7 +77,7 @@ export class EnrichmentCircuitBreaker {
 
   recordIgnoredFailure(permit: CircuitBreakerPermit): void {
     if (permit.generation !== this.generation || !permit.probe) return;
-    this.close();
+    this.probeInFlight = false;
   }
 
   private close(): void {
