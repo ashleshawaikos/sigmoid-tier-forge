@@ -1,158 +1,135 @@
 # TierForge
 
-TierForge imports store CSVs, enriches each store through the supplied local simulator, and computes configurable scores and tiers. Enrichment and scoring are separate: re-scoring reads only persisted metrics and never calls the simulator.
+TierForge is a local web application for enriching store records through the supplied simulator, then scoring and assigning tiers from configurable metric bars and weights.
 
-## Architecture
+## Prerequisites
 
-The application is a local modular monolith:
+- Node.js 24.x (24.15 or newer) and npm 11.16.0
+- Python 3.10 or newer
+- Git
+- On Windows, Visual Studio Build Tools with the C++ workload may be needed to build native npm dependencies such as `better-sqlite3`.
 
-- Angular provides the upload, job dashboard, scoring form, and searchable/paginated results.
-- Express controllers translate HTTP input/output and delegate to application services.
-- Job/scoring services own use-case coordination and domain rules.
-- A typed repository owns SQL queries and transactions; a SQLite connection wrapper owns initialization and schema migrations.
-- A simulator client uses a shared HTTP wrapper and enforces rate limiting, timeout, and response validation.
-- Multiple enrichment jobs can run concurrently; they share the simulator client's request rate limit.
+Check your tool versions:
 
-The SQLite schema tracks `jobs`, per-store `job_stores`, successful `enrichment_results`, one current `scoring_config` per job, and current `store_scores`. The database is created at `backend/data/tierforge.sqlite` by default. Existing data from the previous `store_results` schema is migrated when the backend starts.
-
-## Requirements
-
-- Node.js 24.15+ and npm 11.16.0 (the repository `.nvmrc` selects Node 24)
-- Python 3 and `venv` for the provided simulator
-- Committed npm lockfiles are used for repeatable installs (`npm ci`)
-- On Windows, install Visual Studio Build Tools with the **Desktop development with C++** workload (including the MSVC C++ build tools and a Windows SDK) so native dependencies such as `better-sqlite3` can build when a prebuilt binary is unavailable.
-
-If a Windows backend install fails with `MSB4019` and `Microsoft.Cpp.Default.props` missing, add the C++ workload in Visual Studio Installer, then reopen the terminal and rerun `npm ci` from `backend`.
-
-## Run locally
-
-Run the initial Node setup from the repository root:
-
-```bash
-nvm install
-nvm use
-npm install --global npm@11.16.0
+```sh
 node --version
 npm --version
+python --version
 ```
 
-`node --version` should report Node 24.15 or newer in the 24.x line, and `npm --version` should report `11.16.0`. If you do not use nvm, install those Node/npm versions with your preferred version manager or package manager before continuing.
+The repository includes `.nvmrc` for Node version managers that support it. Use any Node version manager or installer that provides the versions above.
 
-### 1. Install and start the provided simulator
+## Clone and run
 
-```bash
+Run each component in its own terminal. Commands below are from the repository root unless noted.
+
+### 1. Start the enrichment simulator
+
+```sh
 cd enrichment_simulator/enrichment_simulator
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
+python -m venv .venv
 ```
 
-The simulator is ready when `http://localhost:8000/health` returns `{"status":"ok"}`.
+Activate the environment:
 
-### 2. Install and start the backend
+```sh
+# macOS/Linux
+source .venv/bin/activate
 
-In a second terminal, from the repository root. `nvm use` is needed in each terminal because nvm selects Node per shell:
+# Windows PowerShell (use this instead of the command above)
+.\.venv\Scripts\Activate.ps1
+```
 
-```bash
-nvm use
+Install and start the simulator:
+
+```sh
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+The simulator is ready at `http://localhost:8000`; its health endpoint is `http://localhost:8000/health`.
+
+### 2. Build and start the backend
+
+In a second terminal, from the repository root:
+
+```sh
 cd backend
 npm ci
-cp .env.example .env  # first run only
+```
+
+Optionally copy `.env.example` to `.env` and edit the settings. Defaults work for the local setup:
+
+```dotenv
+PORT=4000
+SIMULATOR_BASE_URL=http://localhost:8000
+DATABASE_PATH=./data/tierforge.sqlite
+APP_NAME=TierForge
+```
+
+Build and start:
+
+```sh
+npm run build
 npm start
 ```
 
-The API is ready when `http://localhost:4000/health` returns a `data.status` of `ok`. The database is created at `backend/data/tierforge.sqlite`. `DATABASE_PATH` in `backend/.env` is relative to the backend working directory unless it is absolute.
+For development with automatic TypeScript reload, use `npm run dev` instead of the build/start commands. The API health endpoint is `http://localhost:4000/health`.
 
-### 3. Install and start the Angular frontend
+### 3. Start the frontend
 
 In a third terminal, from the repository root:
 
-```bash
-nvm use
+```sh
 cd frontend
 npm ci
 npm start
 ```
 
-Open `http://localhost:4200`. The frontend calls the API at `http://localhost:4000`.
+Open `http://localhost:4200`. The frontend connects to the backend at `http://localhost:4000`.
 
-## CSV format
+## Use the application
 
-Upload a UTF-8 CSV up to 10 MB with the following required headers; extra columns are allowed:
+Upload a UTF-8 CSV with these required columns:
 
 ```text
 store_id,store_name,address,city,state,country
 ```
 
-Required values must be non-empty and `store_id` values must be unique within the file. Invalid headers, row widths, values, or duplicate IDs return a descriptive validation error.
+The application validates required values and duplicate store IDs. The upload limit is 10 MB; additional columns are allowed. Sample datasets are intentionally not included in this repository; they are supplied separately.
 
-## API
+After enrichment finishes, configure the metric bars, weights (which must total 100), and Large/Medium tier thresholds in the UI. Scoring uses successfully enriched stores and is safe to rerun with updated settings.
 
-All successful responses use `{ "data": ... }`; errors use `{ "error": { "code": "...", "message": "...", "details": ... } }`.
+## Tests and build
 
-| Method and path               | Purpose                                                                             |
-| ----------------------------- | ----------------------------------------------------------------------------------- |
-| `GET /health`                 | Liveness check                                                                      |
-| `POST /api/jobs`              | Multipart CSV upload (`file`, optional `name`); returns `202` with job ID           |
-| `GET /api/jobs`               | List jobs with status and progress counts                                           |
-| `GET /api/jobs/:jobId`        | Job status, enriched/failed/pending counts, and tier breakdown                      |
-| `GET /api/jobs/:jobId/stores` | Paginated/filterable stores; supports `page`, `pageSize`, `tier`, `status`, and `q` |
-| `POST /api/jobs/:jobId/score` | Compute/replace scores from the supplied scoring configuration                      |
-| `GET /api/dashboard`          | Summary for the most recently created job                                           |
+Backend tests (single command):
 
-Scoring request example:
-
-```json
-{
-  "bars": {
-    "estimated_monthly_footfall": 15000,
-    "estimated_monthly_revenue": 150000,
-    "store_size_sqft": 8000
-  },
-  "weights": {
-    "estimated_monthly_footfall": 50,
-    "estimated_monthly_revenue": 30,
-    "store_size_sqft": 20
-  },
-  "thresholds": { "Large": 70, "Medium": 40 }
-}
-```
-
-The configured weights must total 100; score is the sum of weights for the metrics that meet their bars. Large and Medium thresholds must be within 0–100, and Large must be greater than Medium.
-
-## Processing and limitations
-
-- One enrichment job runs at a time. An additional upload receives `409` until that job is terminal.
-- Up to 10 store workers run concurrently; simulator request starts are serialized at 210 ms intervals.
-- Each store receives at most five attempts. Each HTTP request times out after 12 seconds; retry backoff grows exponentially and is capped at 8 seconds.
-- Attempt IDs fence off stale writes. Successful metrics and status are persisted transactionally. Terminal failure reasons and attempt counts remain visible in the results.
-- A job is `completed` when at least one store enriched successfully, even if other stores failed; it is `failed` when every store failed.
-- Scoring can be safely rerun and replaces the prior score/tier rows and configuration for that job.
-- Pending work is marked failed with an interruption reason after a backend restart; in-flight work does not resume automatically. Multiple simultaneous jobs and shared limiting across multiple backend processes are not supported.
-- No user authentication is included; the app is intended for local use with the provided simulator.
-
-## Build and tests
-
-Backend:
-
-```bash
+```sh
 cd backend
-npm run build
+npm ci
 npm test
-
-# Optional formatting check (repository has no standalone lint script)
-cd ../frontend
-./node_modules/.bin/prettier --check --single-quote ../backend/src/app.ts ../backend/src/controllers/*.ts ../backend/src/infrastructure/http/*.ts ../backend/src/lib/*.ts ../backend/src/repositories/*.ts ../backend/src/services/*.ts src/app/*.ts src/app/*.html ../README.md
 ```
 
-Frontend:
+Frontend tests:
 
-```bash
+```sh
 cd frontend
+npm ci
 npm test -- --watch=false
+```
+
+Build checks:
+
+```sh
+# From backend/
+npm run build
+
+# From frontend/
 npm run build
 ```
 
-The sample CSV is `backend/stores_5000.csv`.
-# sigmoid-tier-forge
+## Architecture and limitations
+
+This is a local modular monolith: an Angular frontend, an Express/TypeScript API, a SQLite database, and the separately run enrichment simulator. The backend persists store work and enrichment results before scoring; score/tier values are derived from raw metrics and the current scoring configuration. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the design, resilience behavior, and trade-offs.
+
+The implementation is sized for the provided take-home workflow, including the supplied 5,000-row dataset, not as an unlimited streaming ingestion platform. Upload parsing and insertion are not fully streaming. SQLite is a single-process local database; this application does not coordinate multiple backend instances. Circuit-breaker state and simulator rate limiting are in memory and reset when the backend restarts. Retry attempts and leases are bounded; jobs that become terminal with failures require an explicit retry from the UI. There is no authentication or production deployment configuration.
